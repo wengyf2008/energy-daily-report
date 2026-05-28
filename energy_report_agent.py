@@ -44,8 +44,11 @@ CONFIG = {
     "wecom_webhook": os.environ.get("WECOM_WEBHOOK", ""),
     # 飞书机器人webhook
     "feishu_webhook": os.environ.get("FEISHU_WEBHOOK", ""),
-    # 报告输出路径
-    "output_dir": os.environ.get("REPORT_OUTPUT_DIR", "/workspace/reports"),
+    # 报告输出路径（自动适配环境：GitHub Actions用当前目录，本地用/workspace/reports）
+    "output_dir": os.environ.get("REPORT_OUTPUT_DIR",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
+        if os.path.isdir(os.path.dirname(os.path.abspath(__file__)))
+        else "./reports"),
 }
 
 # ============================================================

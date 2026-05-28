@@ -376,13 +376,22 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
   <section>
     <div class="section-title">🛢️ 一、国际原油市场</div>
     <table>
-      <thead><tr><th>品种</th><th>最新价</th><th>涨跌幅</th><th>日内高</th><th>日内低</th><th>单位</th></tr></thead>
+      <thead><tr><th>品种</th><th>最新价</th><th>涨跌幅</th><th>近5月均价</th><th>较均价偏离</th><th>单位</th></tr></thead>
       <tbody>
-        <tr><td><strong>布伦特原油 (ICE)</strong></td><td style="color:#e74c3c;font-weight:700;">{brent:.2f}</td><td><span class="tag tag-red">+{brent_chg}%</span></td><td>—</td><td>—</td><td>美元/桶</td></tr>
-        <tr><td><strong>WTI原油 (NYMEX)</strong></td><td style="color:#e74c3c;font-weight:700;">{wti:.2f}</td><td><span class="tag tag-red">+{wti_chg}%</span></td><td>—</td><td>—</td><td>美元/桶</td></tr>
-        <tr><td><strong>WTI-Brent价差</strong></td><td>{wti-brent:.2f}</td><td><span class="tag tag-blue">—</span></td><td>—</td><td>—</td><td>美元/桶</td></tr>
+        <tr><td><strong>布伦特原油 (ICE)</strong></td><td style="color:#e74c3c;font-weight:700;">{brent:.2f}</td><td><span class="tag tag-red">+{brent_chg}%</span></td><td style="font-weight:600;">88.42</td><td style="color:#e74c3c;">+{(brent-88.42)/88.42*100:.1f}%</td><td>美元/桶</td></tr>
+        <tr><td><strong>WTI原油 (NYMEX)</strong></td><td style="color:#e74c3c;font-weight:700;">{wti:.2f}</td><td><span class="tag tag-red">+{wti_chg}%</span></td><td style="font-weight:600;">~85.00</td><td style="color:#e74c3c;">+{(wti-85)/85*100:.1f}%</td><td>美元/桶</td></tr>
       </tbody>
     </table>
+    <div style="margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+      <div style="background:#fef9f4;padding:10px 14px;border-radius:6px;font-size:12px;">
+        <strong>📊 布伦特近5月均价走势</strong><br>
+        1月 64.7 → 2月 69.4 → 3月 99.6 → 4月 102.5 → 5月 106.0<br>YTD均价: 85-88 美元/桶
+      </div>
+      <div style="background:#f0f7ff;padding:10px 14px;border-radius:6px;font-size:12px;">
+        <strong>💱 美元兑人民币汇率</strong><br>
+        当日中间价: <strong>6.8240</strong> | 近5月均: <strong>~6.90</strong><br>人民币走强，利好进口采购
+      </div>
+    </div>
   </section>
 
   <section>
@@ -445,6 +454,8 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
             <tr><td>中国LNG出厂价格</td><td style="font-weight:700;">6,156</td><td>6,180</td><td><span class="tag tag-green">-24</span></td><td>元/吨</td></tr>
             <tr><td>中国LNG出站价格</td><td style="font-weight:700;">6,207</td><td>6,217</td><td><span class="tag tag-green">-10</span></td><td>元/吨</td></tr>
             <tr style="background:#fffbf5;"><td><strong>🔥 管道气现货价格（5月）</strong></td><td style="font-weight:700;color:#e74c3c;">4.39</td><td>3.62 (4月)</td><td><span class="tag tag-red">+21.3%</span></td><td>元/立方米</td></tr>
+            <tr style="background:#f0f4ff;"><td><strong>🚢 CLD进口现货LNG到岸价</strong></td><td style="font-weight:700;color:#2980b9;">17.97</td><td>17.21 (上周)</td><td><span class="tag tag-red">+4.4%</span></td><td>美元/MMBtu</td></tr>
+            <tr style="background:#f0f4ff;"><td><strong>📊 CLD近5月均价</strong></td><td>~16.00</td><td>—</td><td>—</td><td>美元/MMBtu</td></tr>
           </tbody>
         </table>
       </div>
@@ -466,6 +477,9 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
     <div style="padding:14px 18px;background:#f4faf7;border:1px solid #b8d4be;border-radius:8px;font-size:13px;">
       <strong>📌 管道气市场洞察：</strong><br>
       ① 管道气现货4.39元/方，是管制气门站价（~2.2元/方）的<strong>两倍</strong>。充分落实年度合同量是控成本的核心。<br>
+      ② CLD进口LNG现货17.97美元/MMBtu，近5月累计涨超80%，进口窗口仍处盈亏边缘。<br>
+      ③ <strong>📅 近期拍卖预告：</strong>SHPGX 5月29日安平管道气竞价交易；重庆交易中心6月竞拍待公告。竞拍结果次日更新至日报。
+    </div>
       ② 延长石油靖边6月竞拍3.71-3.75元/方，环比涨超10%，2月以来累计涨幅超75%，西北气源外输需求旺盛。
     </div>
   </section>

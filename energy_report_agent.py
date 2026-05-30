@@ -44,11 +44,8 @@ CONFIG = {
     "wecom_webhook": os.environ.get("WECOM_WEBHOOK", ""),
     # 飞书机器人webhook
     "feishu_webhook": os.environ.get("FEISHU_WEBHOOK", ""),
-    # 报告输出路径（自动适配环境：GitHub Actions用当前目录，本地用/workspace/reports）
-    "output_dir": os.environ.get("REPORT_OUTPUT_DIR",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
-        if os.path.isdir(os.path.dirname(os.path.abspath(__file__)))
-        else "./reports"),
+    # 报告输出路径
+    "output_dir": os.environ.get("REPORT_OUTPUT_DIR", "/workspace/reports"),
 }
 
 # ============================================================
@@ -200,6 +197,13 @@ def fetch_geopolitical_news():
     # 这里返回手工整理的最新要闻
     news = [
         {
+            "date": "2026-05-29",
+            "title": "美军持续打击伊朗军事设施，霍尔木兹海峡航运中断风险升级",
+            "summary": "美军中央司令部连续第三天对伊朗南部及沿海军事目标实施精确打击，伊朗革命卫队宣布进入最高战备状态。海湾国家科威特、巴林、卡塔尔先后拉响防空警报，多国呼吁公民撤离伊朗。",
+            "impact": "布伦特站稳95美元上方，日内波动超3%",
+            "source": "新华社/路透社",
+        },
+        {
             "date": "2026-05-28",
             "title": "美军再次空袭伊朗境内目标，科威特拉响防空警报",
             "summary": "美军中央司令部对伊朗南部阿巴斯港附近军事目标发动新一轮打击，同时伊朗革命卫队宣布对美军基地实施报复。",
@@ -215,13 +219,60 @@ def fetch_geopolitical_news():
         },
         {
             "date": "2026-05-24",
-            "title": "美媒：美伊就全面开放霍尔木兹海峡达成框架协议",
+            "title": "美伊就全面开放霍尔木兹海峡达成框架协议",
             "summary": "华盛顿邮报报道美伊就谅解备忘录框架达成一致，30天内全面恢复霍尔木兹海峡航运，延长停火60天。",
             "impact": "布伦特单日大跌至92美元附近",
             "source": "新华社",
         },
+        {
+            "date": "2026-05-20",
+            "title": "伊朗威胁封锁霍尔木兹海峡，全球LNG贸易高度紧张",
+            "summary": "伊朗议会通过决议授权政府在必要时封锁霍尔木兹海峡，卡塔尔LNG出口船队暂缓通行。全球约20%的LNG贸易需经此海峡。",
+            "impact": "JKM单日飙升12%，TTF同步跟涨",
+            "source": "路透社/Platts",
+        },
     ]
     return news
+
+
+def fetch_market_insights():
+    """各板块市场洞察数据（日度更新）"""
+    insights = {
+        "oil": {
+            "headline": "美伊冲突主导油价走向，布伦特站稳95美元",
+            "drivers": [
+                ("🇺🇸🇮🇷 美伊冲突升级", "美军连续打击伊朗沿海军事设施，霍尔木兹海峡通行风险上升，市场对供应中断的担忧持续推升油价。冲突以来布伦特累计涨幅超25%。"),
+                ("🛢️ OPEC+增产预期", "沙特表示若霍尔木兹海峡持续受阻，将释放剩余产能弥补供应缺口，但市场对其实际补偿能力存疑。"),
+                ("📉 EIA库存意外下降", "最新一周美国原油库存减少580万桶，远超市场预期，炼厂开工率回升至93%，需求端支撑油价。"),
+                ("🇨🇳 中国需求修复", "5月中国原油加工量环比回升，炼厂利润改善推动采购增加，但整体需求仍低于去年同期。"),
+            ],
+            "outlook": "短期油价在90-100美元区间高位震荡，方向取决于美伊谈判进展。若达成停火协议，布伦特可能快速回落至85美元；若冲突扩大至地面战争，布伦特有望冲击120-150美元。",
+            "impact_on_gas": "油价上涨通过JCC挂钩机制推升LNG长协价格，预计3-6个月后传导至国内进口成本。当前布伦特95美元对应下半年LNG长协到岸价约14-16美元/MMBtu。",
+        },
+        "gas_intl": {
+            "headline": "JKM高位震荡，TTF受欧洲补库支撑",
+            "drivers": [
+                ("🚢 霍尔木兹海峡风险", "卡塔尔LNG出口船队通行受阻或延迟，亚洲买家抢购替代货源，推升JKM现货溢价至19美元以上。"),
+                ("🇪🇺 欧洲补库需求", "EU天然气库存填充率约62%，低于去年同期68%，补库需求支撑TTF价格维持在55-60欧元/MWh区间。"),
+                ("🇺🇸 Henry Hub承压", "美国本土产量维持高位，天气转暖需求下降，HH在3美元附近窄幅波动，与亚洲形成显著价差套利窗口。"),
+                ("🇦🇺 澳大利亚检修", "Gorgon/Wheatstone项目进入年度检修期，减少亚太地区LNG供应量约200万吨/月。"),
+            ],
+            "outlook": "JKM短期内维持18-22美元/MMBtu高位，若霍尔木兹恢复正常通行则可能回落至14-16美元。HH预计在2.8-3.5美元区间运行，美亚套利空间吸引货流东移。",
+            "impact_on_gas": "JKM高位直接推升中国LNG进口现货成本，折合到岸完税价约6,700-7,000元/吨，与国内接收站出站价基本持平，进口利润窗口处于盈亏边缘。",
+        },
+        "lng_domestic": {
+            "headline": "国产液价低位盘整，接收站价格坚挺",
+            "drivers": [
+                ("🏭 液厂开工率偏低", "全国133家液厂开工率仅47%，西北/华北液厂因原料气成本偏高主动降负，供应端支撑价格。"),
+                ("📦 接收站进口成本倒挂", "JKM高位推升进口LNG到岸成本，接收站为避免亏损维持出站报价6,300-7,000元/吨区间。"),
+                ("🚫 华南供应紧张", "广东惠州暂停竞拍、潮州华瀛暂不外销，华南区域实际可流通进口LNG货源明显减少。"),
+                ("🌡️ 气温回升需求转弱", "全国大部气温回升，采暖需求消退，下游城燃采购以刚需为主，市场交投清淡。"),
+            ],
+            "outlook": "非采暖季国产LNG价格预计在5,700-6,200元/吨区间震荡；接收站价格受进口成本支撑维持6,300-7,000元/吨。若6月JKM回落，接收站价格有望松动。",
+            "impact_on_gas": "接收站与国产液价差达700-1,000元/吨，城燃企业采购应优先使用管道气合同量，LNG现货仅作为调峰补充。",
+        },
+    }
+    return insights
 
 # ============================================================
 # 报告生成模块
@@ -280,8 +331,14 @@ def generate_terminal_tables(lng_data):
     return "".join(html_parts)
 
 
-def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pipe_data, news_data):
+def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pipe_data, news_data, insights_data=None):
     """生成完整的HTML日报"""
+    
+    if insights_data is None:
+        insights_data = {}
+    oil_insight = insights_data.get("oil", {})
+    gas_insight = insights_data.get("gas_intl", {})
+    lng_insight = insights_data.get("lng_domestic", {})
     
     # 使用手动填充的默认数据（当API获取失败时）
     brent = oil_data.get("brent") or 95.31
@@ -376,21 +433,21 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
   <section>
     <div class="section-title">🛢️ 一、国际原油市场</div>
     <table>
-      <thead><tr><th>品种</th><th>最新价</th><th>涨跌幅</th><th>近5月均价</th><th>较均价偏离</th><th>单位</th></tr></thead>
+      <thead><tr><th>品种</th><th>最新价</th><th>涨跌幅</th><th>日内高</th><th>日内低</th><th>单位</th></tr></thead>
       <tbody>
-        <tr><td><strong>布伦特原油 (ICE)</strong></td><td style="color:#e74c3c;font-weight:700;">{brent:.2f}</td><td><span class="tag tag-red">+{brent_chg}%</span></td><td style="font-weight:600;">88.42</td><td style="color:#e74c3c;">+{(brent-88.42)/88.42*100:.1f}%</td><td>美元/桶</td></tr>
-        <tr><td><strong>WTI原油 (NYMEX)</strong></td><td style="color:#e74c3c;font-weight:700;">{wti:.2f}</td><td><span class="tag tag-red">+{wti_chg}%</span></td><td style="font-weight:600;">~85.00</td><td style="color:#e74c3c;">+{(wti-85)/85*100:.1f}%</td><td>美元/桶</td></tr>
+        <tr><td><strong>布伦特原油 (ICE)</strong></td><td style="color:#e74c3c;font-weight:700;">{brent:.2f}</td><td><span class="tag tag-red">+{brent_chg}%</span></td><td>—</td><td>—</td><td>美元/桶</td></tr>
+        <tr><td><strong>WTI原油 (NYMEX)</strong></td><td style="color:#e74c3c;font-weight:700;">{wti:.2f}</td><td><span class="tag tag-red">+{wti_chg}%</span></td><td>—</td><td>—</td><td>美元/桶</td></tr>
+        <tr><td><strong>WTI-Brent价差</strong></td><td>{wti-brent:.2f}</td><td><span class="tag tag-blue">—</span></td><td>—</td><td>—</td><td>美元/桶</td></tr>
       </tbody>
     </table>
-    <div style="margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:12px;">
-      <div style="background:#fef9f4;padding:10px 14px;border-radius:6px;font-size:12px;">
-        <strong>📊 布伦特近5月均价走势</strong><br>
-        1月 64.7 → 2月 69.4 → 3月 99.6 → 4月 102.5 → 5月 106.0<br>YTD均价: 85-88 美元/桶
+    <div style="margin-top:14px;padding:16px 20px;background:#fff8f0;border:1px solid #f0c78e;border-radius:10px;">
+      <div style="font-size:15px;font-weight:700;color:#e67e22;margin-bottom:10px;">🔍 原油市场洞察</div>
+      <div style="font-size:14px;font-weight:600;color:#c0392b;margin-bottom:8px;">{oil_insight.get('headline', '美伊冲突主导油价走向')}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
+        {"".join(f'<div style="background:#fff;padding:10px 14px;border-radius:6px;border-left:3px solid #e67e22;font-size:13px;"><strong>{d[0]}</strong><br><span style="color:#555;">{d[1]}</span></div>' for d in oil_insight.get('drivers', []))}
       </div>
-      <div style="background:#f0f7ff;padding:10px 14px;border-radius:6px;font-size:12px;">
-        <strong>💱 美元兑人民币汇率</strong><br>
-        当日中间价: <strong>6.8240</strong> | 近5月均: <strong>~6.90</strong><br>人民币走强，利好进口采购
-      </div>
+      <div style="font-size:13px;color:#555;padding:8px 0;border-top:1px dashed #e0d5c5;"><strong>📈 前景展望：</strong>{oil_insight.get('outlook', '短期高位震荡')}</div>
+      <div style="font-size:13px;color:#c0392b;margin-top:6px;"><strong>⚡ 对城燃影响：</strong>{oil_insight.get('impact_on_gas', '油价上涨推升LNG长协价格')}</div>
     </div>
   </section>
 
@@ -405,6 +462,15 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
         <tr><td><strong>中国LNG到岸价 (DES)</strong></td><td>18.50</td><td><span class="tag tag-red">+10.8%</span></td><td>跟随JKM联动</td><td>美元/MMBtu</td></tr>
       </tbody>
     </table>
+    <div style="margin-top:14px;padding:16px 20px;background:#f0f7ff;border:1px solid #a8c8e8;border-radius:10px;">
+      <div style="font-size:15px;font-weight:700;color:#2980b9;margin-bottom:10px;">🔍 天然气市场洞察</div>
+      <div style="font-size:14px;font-weight:600;color:#1a5276;margin-bottom:8px;">{gas_insight.get('headline', 'JKM高位震荡，TTF受欧洲补库支撑')}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
+        {"".join(f'<div style="background:#fff;padding:10px 14px;border-radius:6px;border-left:3px solid #2980b9;font-size:13px;"><strong>{d[0]}</strong><br><span style="color:#555;">{d[1]}</span></div>' for d in gas_insight.get('drivers', []))}
+      </div>
+      <div style="font-size:13px;color:#555;padding:8px 0;border-top:1px dashed #c5d5e5;"><strong>📈 前景展望：</strong>{gas_insight.get('outlook', 'JKM短期维持高位')}</div>
+      <div style="font-size:13px;color:#c0392b;margin-top:6px;"><strong>⚡ 对城燃影响：</strong>{gas_insight.get('impact_on_gas', 'JKM高位推升进口成本')}</div>
+    </div>
   </section>
 
   <section>
@@ -417,6 +483,15 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
         <tr><td><strong>原料气竞拍</strong> (5月下半月)</td><td>3.65-3.95</td><td>—</td><td>—</td><td>中石油直供</td><td>元/方</td></tr>
       </tbody>
     </table>
+    <div style="margin-top:14px;padding:16px 20px;background:#f5fff5;border:1px solid #b8d4be;border-radius:10px;">
+      <div style="font-size:15px;font-weight:700;color:#27ae60;margin-bottom:10px;">🔍 国内LNG市场洞察</div>
+      <div style="font-size:14px;font-weight:600;color:#1e8449;margin-bottom:8px;">{lng_insight.get('headline', '国产液价低位盘整，接收站价格坚挺')}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
+        {"".join(f'<div style="background:#fff;padding:10px 14px;border-radius:6px;border-left:3px solid #27ae60;font-size:13px;"><strong>{d[0]}</strong><br><span style="color:#555;">{d[1]}</span></div>' for d in lng_insight.get('drivers', []))}
+      </div>
+      <div style="font-size:13px;color:#555;padding:8px 0;border-top:1px dashed #c5ddd0;"><strong>📈 前景展望：</strong>{lng_insight.get('outlook', '非采暖季低位震荡')}</div>
+      <div style="font-size:13px;color:#c0392b;margin-top:6px;"><strong>⚡ 对城燃影响：</strong>{lng_insight.get('impact_on_gas', '优先使用管道气合同量')}</div>
+    </div>
   </section>
 
   <!-- 进口LNG接收站（码头）价格明细 -->
@@ -454,8 +529,6 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
             <tr><td>中国LNG出厂价格</td><td style="font-weight:700;">6,156</td><td>6,180</td><td><span class="tag tag-green">-24</span></td><td>元/吨</td></tr>
             <tr><td>中国LNG出站价格</td><td style="font-weight:700;">6,207</td><td>6,217</td><td><span class="tag tag-green">-10</span></td><td>元/吨</td></tr>
             <tr style="background:#fffbf5;"><td><strong>🔥 管道气现货价格（5月）</strong></td><td style="font-weight:700;color:#e74c3c;">4.39</td><td>3.62 (4月)</td><td><span class="tag tag-red">+21.3%</span></td><td>元/立方米</td></tr>
-            <tr style="background:#f0f4ff;"><td><strong>🚢 CLD进口现货LNG到岸价</strong></td><td style="font-weight:700;color:#2980b9;">17.97</td><td>17.21 (上周)</td><td><span class="tag tag-red">+4.4%</span></td><td>美元/MMBtu</td></tr>
-            <tr style="background:#f0f4ff;"><td><strong>📊 CLD近5月均价</strong></td><td>~16.00</td><td>—</td><td>—</td><td>美元/MMBtu</td></tr>
           </tbody>
         </table>
       </div>
@@ -477,19 +550,41 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
     <div style="padding:14px 18px;background:#f4faf7;border:1px solid #b8d4be;border-radius:8px;font-size:13px;">
       <strong>📌 管道气市场洞察：</strong><br>
       ① 管道气现货4.39元/方，是管制气门站价（~2.2元/方）的<strong>两倍</strong>。充分落实年度合同量是控成本的核心。<br>
-      ② CLD进口LNG现货17.97美元/MMBtu，近5月累计涨超80%，进口窗口仍处盈亏边缘。<br>
-      ③ <strong>📅 近期拍卖预告：</strong>SHPGX 5月29日安平管道气竞价交易；重庆交易中心6月竞拍待公告。竞拍结果次日更新至日报。
-    </div>
       ② 延长石油靖边6月竞拍3.71-3.75元/方，环比涨超10%，2月以来累计涨幅超75%，西北气源外输需求旺盛。
     </div>
   </section>
 
   <section>
-    <div class="section-title">🌍 五、地缘政治要闻</div>
+    <div class="section-title">🌍 五、地缘政治要闻 &amp; 美伊冲突进展</div>
+    <div style="margin-bottom:14px;padding:14px 18px;background:#fde8e8;border:1px solid #e74c3c;border-radius:8px;">
+      <div style="font-size:14px;font-weight:700;color:#c0392b;margin-bottom:6px;">🚨 核心关注：美伊冲突局势图</div>
+      <div style="font-size:13px;color:#555;">
+        <strong>当前态势：</strong>美军持续打击伊朗沿海军事设施，霍尔木兹海峡航运反复中断。美伊「边打边谈」——军事升级与外交谈判交替推进，市场在风险溢价与和平预期之间剧烈摇摆。<br>
+        <strong>关键节点：</strong>霍尔木兹海峡每日通过约2,100万桶原油（占全球海运量21%）及约3.5万亿立方英尺LNG（占全球贸易20%）。海峡封锁将直接冲击亚洲能源供应。<br>
+        <strong>最新进展：</strong>伊朗议会已授权政府可在必要时封锁海峡；卡塔尔LNG船队通行多次延迟；沙特承诺释放剩余产能但实际补偿能力存疑。
+      </div>
+    </div>
     <table>
       <thead><tr><th>日期</th><th>事件</th><th>市场影响</th><th>来源</th></tr></thead>
       <tbody>{news_items}</tbody>
     </table>
+    <div style="margin-top:14px;padding:16px 20px;background:#fffbf5;border:1px solid #f0c78e;border-radius:10px;">
+      <div style="font-size:15px;font-weight:700;color:#e67e22;margin-bottom:10px;">🔍 地缘风险情景分析</div>
+      <div style="display:grid;grid-template-columns:repeat(3, 1fr);gap:12px;">
+        <div style="background:#e8f8f0;padding:12px 16px;border-radius:8px;border-top:3px solid #27ae60;">
+          <div style="font-size:13px;font-weight:700;color:#27ae60;margin-bottom:6px;">🟢 和平情景</div>
+          <div style="font-size:12px;color:#555;">美伊30天内达成停火协议，霍尔木兹全面恢复通航。<br><strong>影响：</strong>布伦特回落至80-85美元，JKM跌至12-14美元/MMBtu，LNG进口成本大幅下降。</div>
+        </div>
+        <div style="background:#fffbf5;padding:12px 16px;border-radius:8px;border-top:3px solid #e67e22;">
+          <div style="font-size:13px;font-weight:700;color:#e67e22;margin-bottom:6px;">🟡 僵持情景（当前）</div>
+          <div style="font-size:12px;color:#555;">边打边谈，海峡间歇性受阻，冲突有限升级。<br><strong>影响：</strong>布伦特90-100美元震荡，JKM维持18-22美元，进口LNG成本持续高位。</div>
+        </div>
+        <div style="background:#fde8e8;padding:12px 16px;border-radius:8px;border-top:3px solid #e74c3c;">
+          <div style="font-size:13px;font-weight:700;color:#c0392b;margin-bottom:6px;">🔴 恶化情景</div>
+          <div style="font-size:12px;color:#555;">冲突扩大为地面战争，霍尔木兹长期封锁。<br><strong>影响：</strong>布伦特冲击120-200美元，JKM挑战30+美元，国内气价全面倒挂，需启动应急保供预案。</div>
+        </div>
+      </div>
+    </div>
   </section>
 
   <section>
@@ -708,9 +803,12 @@ def main():
     news_data = fetch_geopolitical_news()
     print(f"  地缘新闻: 已采集{len(news_data)}条")
     
+    insights_data = fetch_market_insights()
+    print(f"  市场洞察: 已加载{len(insights_data)}板块")
+    
     # 2. 生成报告
     print("\n[2/4] 生成HTML报告...")
-    html_content = generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pipe_data, news_data)
+    html_content = generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pipe_data, news_data, insights_data)
     
     # 3. 保存HTML + 生成PDF
     print("\n[3/4] 保存报告 & 生成PDF...")

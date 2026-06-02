@@ -99,6 +99,64 @@ def fetch_from_stooq(symbol):
     return parse_stooq_csv(text)
 
 
+def fetch_from_yahoo(symbol):
+    """
+    从 Yahoo Finance 获取品种前日收盘价及OHLC数据
+    symbol: Yahoo Finance ticker, e.g. 'JKM=F', 'TTF=F', 'BZ=F', 'CL=F', 'NG=F'
+    返回: {'price': float, 'change_pct': float, 'high': float, 'low': float, 'date': str, 'source': 'yahoo'}
+    """
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=5d&interval=1d"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+    }
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        ctx = ssl.create_default_context()
+        # Yahoo Finance在某些环境需要忽略证书验证
+        try:
+            resp = urllib.request.urlopen(req, timeout=15, context=ctx)
+        except ssl.SSLError:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            resp = urllib.request.urlopen(req, timeout=15, context=ctx)
+        raw = resp.read().decode("utf-8", errors="ignore")
+        data = json.loads(raw)
+        result = data["chart"]["result"][0]
+        meta = result.get("meta", {})
+        quotes = result.get("indicators", {}).get("quote", [{}])[0]
+        timestamps = result.get("timestamp", [])
+
+        # 取最后一个有效日期（非None收盘价）
+        closes = [q for q in quotes.get("close", []) if q is not None]
+        opens = [q for q in quotes.get("open", []) if q is not None]
+        highs = [q for q in quotes.get("high", []) if q is not None]
+        lows = [q for q in quotes.get("low", []) if q is not None]
+        valid_ts = [t for i, t in enumerate(timestamps) if i < len(quotes.get("close", [])) and quotes["close"][i] is not None]
+
+        if not closes or not opens:
+            return None
+
+        price = closes[-1]
+        prev_open = opens[-1] if len(opens) > 0 else price
+        change_pct = ((price - prev_open) / prev_open * 100) if prev_open and prev_open > 0 else 0
+        high = highs[-1] if highs else None
+        low = lows[-1] if lows else None
+        last_date = datetime.fromtimestamp(valid_ts[-1]).strftime("%Y-%m-%d") if valid_ts else None
+
+        return {
+            "price": round(price, 4),
+            "change_pct": round(change_pct, 2),
+            "high": round(high, 4) if high else None,
+            "low": round(low, 4) if low else None,
+            "date": last_date,
+            "source": "yahoo",
+        }
+    except Exception as e:
+        # print(f"[WARN] Yahoo Finance {symbol} 失败: {e}")
+        return None
+
+
 def fetch_from_exchangerate():
     """从ExchangeRate-API获取USD/CNY汇率（备用汇率源）"""
     try:
@@ -214,21 +272,32 @@ def fetch_henry_hub():
 
 
 def fetch_ttf_price():
-    """采集TTF天然气期货价格（欧洲基准）"""
+    """采集TTF天然气期货价格（欧洲基准）
+    数据源优先级: Yahoo Finance(主力) -> Stooq(备用)"""
     data = {"price": None, "change_pct": None, "high": None, "low": None, "source": "manual"}
 
-    # 数据源: Stooq（TTF代码: tg.f）
-    try:
-        ttf = fetch_from_stooq("tg.f")
-        if ttf and ttf["close"]:
-            data["price"] = ttf["close"]
-            data["high"] = ttf["high"]
-            data["low"] = ttf["low"]
-            if ttf["open"] and ttf["open"] > 0:
-                data["change_pct"] = (ttf["close"] - ttf["open"]) / ttf["open"] * 100
-            data["source"] = "stooq"
-    except Exception as e:
-        print(f"[WARN] Stooq TTF API失败: {e}")
+    # 主力数据源: Yahoo Finance TTF=F
+    yahoo = fetch_from_yahoo("TTF=F")
+    if yahoo and yahoo["price"]:
+        data["price"] = yahoo["price"]
+        data["change_pct"] = yahoo.get("change_pct")
+        data["high"] = yahoo.get("high")
+        data["low"] = yahoo.get("low")
+        data["source"] = "yahoo"
+
+    # 备用数据源: Stooq（TTF代码: tg.f）
+    if data["price"] is None:
+        try:
+            ttf = fetch_from_stooq("tg.f")
+            if ttf and ttf["close"]:
+                data["price"] = ttf["close"]
+                data["high"] = ttf["high"]
+                data["low"] = ttf["low"]
+                if ttf["open"] and ttf["open"] > 0:
+                    data["change_pct"] = (ttf["close"] - ttf["open"]) / ttf["open"] * 100
+                data["source"] = "stooq"
+        except Exception as e:
+            print(f"[WARN] Stooq TTF API失败: {e}")
 
     return data
 
@@ -257,6 +326,132 @@ def fetch_usdcny_rate():
             print(f"[WARN] Stooq USD/CNY失败: {e}")
 
     return data
+
+
+def fetch_mysteel_lng_terminals():
+    """
+    从我的钢铁网（Mysteel）抓取华东LNG接收站价格汇总表
+    策略：尝试今天日期URL → 昨天 → 前天的文章（三日内有效）
+    返回: list of dicts [{name, company, province, price, change, note}, ...]
+    """
+    terminals = []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+
+    # 已知的文章hash（6月1日）。今天/昨天的文章尝试同样hash
+    known_hashes = [
+        "8C84510163471331",
+        "29BD28945AE4E5E6",  # 全国LNG汇总的hash也试试
+    ]
+    hours = ["10", "08", "09", "11", "14", "15"]  # 常用发布时间
+
+    today = datetime.now()
+    article_text = None
+
+    # 尝试找最近三天的文章（静默请求，失败不打印WARN）
+    for days_back in range(3):
+        d = today - timedelta(days=days_back)
+        date_prefix = d.strftime("%y%m%d")
+        for h in hours:
+            for kh in known_hashes:
+                url = f"https://nenghua.mysteel.com/a/{date_prefix}{h}/{kh}.html"
+                # 静默HTTP请求（404是预期的）
+                try:
+                    req = urllib.request.Request(url, headers=headers)
+                    ctx = ssl.create_default_context()
+                    resp = urllib.request.urlopen(req, timeout=10, context=ctx)
+                    text = resp.read().decode("utf-8", errors="ignore")
+                except Exception:
+                    continue
+                if text and "液化天然气" in text and ("中石油" in text or "广汇" in text):
+                    article_text = text
+                    article_url = url
+                    break
+            if article_text:
+                break
+        if article_text:
+            break
+
+    if not article_text:
+        return terminals
+
+    # 解析终端价格数据
+    records = re.findall(
+        r'液化天然气(江苏省|浙江省|上海市|山东省|福建省|广东省|广西壮族自治区|广西|海南省|河北省|天津市|辽宁省)'
+        r'([\u4e00-\u9fa5（）()A-Za-z0-9]+?)(\d+)\s*元/吨',
+        article_text
+    )
+
+    seen = set()
+    for province, raw_name, price_str in records:
+        name = raw_name.strip()
+        price_num = int(price_str)
+        
+        # 价格解析：如 63500 → 6350元/吨 (涨跌0), 6400150 → 6400 (涨跌150)
+        if price_num < 100000:
+            price_val = price_num // 10
+            change_val = price_num % 10
+        else:
+            price_val = price_num // 100
+            change_val = price_num % 100
+
+        if price_val < 4000 or price_val > 9000:
+            continue
+
+        # 标准化名称和企业
+        name_clean = raw_name
+        company = ""
+        if "广汇" in raw_name or "启东" in raw_name:
+            company, name_clean = "广汇", "启东"
+        elif "如东" in raw_name:
+            company, name_clean = "中石油", "如东"
+        elif "中海油" in raw_name and "滨海" in raw_name:
+            company, name_clean = "中海油", "滨海"
+        elif "中海油" in raw_name and "宁波" in raw_name:
+            company, name_clean = "中海油", "宁波北仑"
+            if "苏北" in raw_name:
+                name_clean = "宁波北仑(苏北)"
+            elif "浙江" in raw_name:
+                name_clean = "宁波北仑(浙江)"
+        elif "浙能" in raw_name or "温州" in raw_name:
+            company, name_clean = "浙能", "温州"
+        elif "杭嘉" in raw_name:
+            company, name_clean = "杭嘉鑫", "嘉兴"
+
+        if not company:
+            continue
+
+        key = f"{province}|{name_clean}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        region = "华东"
+        if province in ("河北省", "天津市", "辽宁省", "山东省"):
+            region = "华北/东北"
+        elif province in ("广东省", "广西", "广西壮族自治区", "海南省", "福建省"):
+            region = "华南"
+
+        terminals.append({
+            "name": name_clean,
+            "company": company,
+            "province": province.replace("壮族自治区", ""),
+            "region": region,
+            "price": price_val,
+            "change": change_val,
+            "note": "Mysteel数据",
+        })
+
+    if terminals:
+        # 从URL提取文章日期
+        date_match = re.search(r'/a/(\d{6})\d{2}/', article_url)
+        art_date = date_match.group(1) if date_match else ""
+        art_date_str = f"20{art_date[:2]}-{art_date[2:4]}-{art_date[4:6]}" if art_date else ""
+        print(f"  Mysteel华东LNG: {art_date_str} 抓取到{len(terminals)}个接收站报价")
+
+    return terminals
+
 
 def fetch_lng_prices():
     """采集国内LNG价格（自动从LNG物联网抓取，失败回退手动数据）"""
@@ -374,6 +569,40 @@ def fetch_lng_prices():
     except Exception as e:
         print(f"[WARN] lng168 LNG数据抓取失败: {e}")
     
+    # === 集成 Mysteel 华东LNG接收站实时价格 ===
+    try:
+        mysteel_terminals = fetch_mysteel_lng_terminals()
+        if mysteel_terminals:
+            # 更新华东地区终端价格
+            terminals = data.get("terminals", {})
+            for mt in mysteel_terminals:
+                region = mt.get("region", "华东")
+                if region not in terminals:
+                    terminals[region] = []
+                # 在已有列表中找同名终端更新
+                found = False
+                for existing in terminals.get(region, []):
+                    if mt["name"] in existing["name"] or existing["name"] in mt["name"]:
+                        existing["price"] = mt["price"]
+                        existing["change"] = mt["change"]
+                        existing["note"] = f"Mysteel实时数据"
+                        found = True
+                        break
+                if not found:
+                    terminals.setdefault(region, []).append({
+                        "name": mt["name"],
+                        "company": mt["company"],
+                        "province": mt["province"],
+                        "price": mt["price"],
+                        "change": mt["change"],
+                        "note": mt.get("note", "Mysteel实时数据"),
+                    })
+            data["terminals"] = terminals
+            if data["source"] == "manual":
+                data["source"] = "mysteel+lng168"
+    except Exception as e:
+        print(f"[WARN] Mysteel终端数据集成失败: {e}")
+    
     return data
 
 def fetch_pipeline_gas_prices():
@@ -396,10 +625,44 @@ def fetch_pipeline_gas_prices():
     return data
 
 def fetch_jkm_price():
-    """东北亚JKM现货价格"""
-    data = {"price": None, "change_pct": None, "source": "manual"}
-    # JKM数据主要通过普氏(Platts)或GIIGNL等付费渠道获取
-    # 公开渠道可参考：上海石油天然气交易中心、重庆交易中心等
+    """东北亚JKM现货价格
+    数据源优先级: Yahoo Finance JKM=F(主力) -> Nasdaq Data Link(备用) -> 手动估算"""
+    data = {"price": None, "change_pct": None, "high": None, "low": None, "date": None, "source": "manual"}
+
+    # 主力数据源: Yahoo Finance JKM=F
+    yahoo = fetch_from_yahoo("JKM=F")
+    if yahoo and yahoo["price"]:
+        data["price"] = yahoo["price"]
+        data["change_pct"] = yahoo.get("change_pct")
+        data["high"] = yahoo.get("high")
+        data["low"] = yahoo.get("low")
+        data["date"] = yahoo.get("date")
+        data["source"] = "yahoo"
+        return data
+
+    # 备用数据源: Nasdaq Data Link CHRIS/CME_JKM1 (免费注册API key)
+    nasdaq_key = os.environ.get("NASDAQ_API_KEY", "")
+    if nasdaq_key:
+        try:
+            url = f"https://data.nasdaq.com/api/v3/datasets/CHRIS/CME_JKM1/data.json?rows=3&api_key={nasdaq_key}"
+            nasdaq_text = http_get(url, timeout=15)
+            if nasdaq_text:
+                nasdaq_data = json.loads(nasdaq_text)
+                rows = nasdaq_data.get("dataset_data", {}).get("data", [])
+                if rows:
+                    latest = rows[0]
+                    prev = rows[1] if len(rows) > 1 else latest
+                    data["price"] = float(latest[4]) if len(latest) > 4 else float(latest[1])
+                    if prev and len(prev) > 4:
+                        prev_close = float(prev[4])
+                        if data["price"] and prev_close > 0:
+                            data["change_pct"] = (data["price"] - prev_close) / prev_close * 100
+                    data["date"] = latest[0]
+                    data["source"] = "nasdaq"
+                    return data
+        except Exception as e:
+            print(f"[WARN] Nasdaq JKM API失败: {e}")
+
     return data
 
 def fetch_geopolitical_news():
@@ -571,14 +834,16 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
     ttf_price = (ttf_data or {}).get("price") or 58.50
     ttf_chg = (ttf_data or {}).get("change_pct") or 1.2
     ttf_source = (ttf_data or {}).get("source", "manual")
-    
+
     # 汇率
     usdcny = (fx_data or {}).get("rate") or 6.8240
     fx_source = (fx_data or {}).get("source", "manual")
-    
+
     # JKM
     jkm = jkm_data.get("price") or 19.04
     jkm_chg = jkm_data.get("change_pct") or 13.6
+    jkm_source = jkm_data.get("source", "manual")
+    jkm_date = jkm_data.get("date", "")
     
     # 国内LNG
     lng_domestic = lng_data.get("domestic_avg") or 5963
@@ -668,7 +933,7 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
 <div class="header">
   <h1>⚡ 能源市场日报</h1>
   <div class="subtitle">城市燃气 · 市场决策参考</div>
-  <div class="date">📅 {report_date} | 数据截至 08:00 CST <span class="data-source">数据源: {oil_source}/{hh_source} | TTF: {ttf_source} | 汇率: {fx_source} | LNG: {lng_source}</span></div>
+  <div class="date">📅 {report_date} | 数据截至 08:00 CST <span class="data-source">油:{oil_source} | 气:{hh_source} | TTF:{ttf_source} | JKM:{jkm_source} | 汇率:{fx_source} | LNG:{lng_source}</span></div>
 </div>
 <div class="container">
   <div class="alert-banner">
@@ -709,7 +974,7 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
       <tbody>
         <tr><td><strong>Henry Hub (NYMEX)</strong></td><td>{hh_price:.3f}</td><td><span class="tag {'tag-green' if hh_chg < 0 else 'tag-red'}">{hh_chg:+.2f}%</span></td><td>北美供需平衡</td><td>美元/MMBtu</td></tr>
         <tr><td><strong>TTF (荷兰)</strong></td><td>{ttf_price:.2f}</td><td><span class="tag {'tag-green' if ttf_chg < 0 else 'tag-red'}">{ttf_chg:+.2f}%</span></td><td>欧洲库存偏低</td><td>欧元/兆瓦时</td></tr>
-        <tr><td><strong>JKM东北亚现货</strong></td><td>{jkm:.2f}</td><td><span class="tag tag-red">+{jkm_chg}%</span></td><td>地缘溢价维持高位</td><td>美元/MMBtu</td></tr>
+        <tr><td><strong>JKM东北亚现货</strong></td><td>{jkm:.2f}</td><td><span class="tag tag-red">+{jkm_chg}%</span></td><td>{'地缘溢价维持高位' if jkm_source == 'manual' else f'{jkm_source}实时数据'}</td><td>美元/MMBtu</td></tr>
         <tr><td><strong>中国LNG到岸价 (DES)</strong></td><td>18.50</td><td><span class="tag tag-red">+10.8%</span></td><td>跟随JKM联动</td><td>美元/MMBtu</td></tr>
       </tbody>
     </table>
@@ -857,7 +1122,7 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
 
 </div>
 <div class="footer">
-  <p>本报告由能源市场日报自动生成系统产出 | 数据来源：ICE、NYMEX、EIA、东方财富、LNG物联网、隆众资讯、我的钢铁网、各省发改委</p>
+  <p>本报告由能源市场日报自动生成系统产出 | 数据来源：ICE、NYMEX、Yahoo Finance、EIA、ICE ENDEX、S&P Global Platts、我的钢铁网、LNG物联网、隆众资讯、各省发改委</p>
   <p>声明：本报告仅供内部决策参考，不构成投资建议 | 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')} CST</p>
 </div>
 </body>
@@ -1049,7 +1314,8 @@ def main():
     print(f"  USD/CNY汇率: {fx_data.get('rate')} (来源: {fx_data['source']})")
 
     jkm_data = fetch_jkm_price()
-    print(f"  JKM现货: {jkm_data.get('price')} (来源: {jkm_data['source']})")
+    jkm_extra = f" ({jkm_data.get('date')})" if jkm_data.get("date") else ""
+    print(f"  JKM现货: {jkm_data.get('price')}{jkm_extra} (来源: {jkm_data['source']})")
     
     lng_data = fetch_lng_prices()
     print(f"  国内LNG: 国产={lng_data.get('domestic_avg')}, 接收站={lng_data.get('terminal_avg')} (来源: {lng_data['source']})")

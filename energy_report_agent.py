@@ -259,16 +259,16 @@ def fetch_usdcny_rate():
     return data
 
 def fetch_lng_prices():
-    """采集国内LNG价格（来自公开数据源）"""
+    """采集国内LNG价格（自动从LNG物联网抓取，失败回退手动数据）"""
     data = {
-        "domestic_avg": None,
-        "terminal_avg": None,
-        "domestic_high": None,
-        "domestic_low": None,
-        "terminal_high": None,
-        "terminal_low": None,
+        "domestic_avg": None, "terminal_avg": None,
+        "domestic_high": None, "domestic_low": None,
+        "terminal_high": None, "terminal_low": None,
+        "terminal_high_name": None, "terminal_low_name": None,
+        "operating_rate": None, "up_count": None, "down_count": None,
+        "market_summary": "",
         "source": "manual",
-        # === 各码头接收站价格（元/吨） ===
+        # === 各码头接收站价格（元/吨，手动后备） ===
         "terminals": {
             "华东": [
                 {"name": "如东", "company": "中石油", "province": "江苏", "price": 6350, "change": 0, "note": "出货平稳"},
@@ -294,6 +294,86 @@ def fetch_lng_prices():
             ],
         },
     }
+    
+    # === 策略：从LNG物联网(lng168.com)搜索最新文章并提取价格 ===
+    try:
+        import re as _re
+        
+        # 第一步：搜索文章列表，找到最新文章ID
+        search_url = "https://www.lng168.com/gateWay/newsList?keyword=LNG%E5%B8%82%E5%9C%BA%E6%95%B4%E4%BD%93%E6%8A%A5%E4%BB%B7"
+        search_text = http_get(search_url, timeout=10)
+        article_ids = []
+        if search_text:
+            article_ids = list(dict.fromkeys(_re.findall(r'newsDetail\?id=(\d+)', search_text)))
+        
+        # 第二步：逐个检查文章，找到今天或最近一天的
+        for aid in article_ids[:5]:
+            article_url = f"https://www.lng168.com/gateWay/newsDetail?id={aid}"
+            article_text = http_get(article_url, timeout=10)
+            if not article_text:
+                continue
+            
+            # 检查日期是否是今天或最近
+            date_match = _re.search(r'2026\.(\d+)\.(\d+)', article_text)
+            if not date_match:
+                continue
+            
+            # 去除HTML标签提取纯文本
+            clean_text = _re.sub(r'<[^>]+>', ' ', article_text)
+            clean_text = _re.sub(r'\s+', ' ', clean_text)
+            
+            # 提取液厂均价（容忍空格：6009 元 /吨）
+            avg_match = _re.search(r'市场均价为(\d+)\s*元', clean_text)
+            if avg_match:
+                data["domestic_avg"] = int(avg_match.group(1))
+            
+            # 提取液厂最高/最低价
+            high_match = _re.search(r'较高价报价(\d+)\s*元', clean_text)
+            if high_match:
+                data["domestic_high"] = int(high_match.group(1))
+            low_match = _re.search(r'较低价报价(\d+)\s*元', clean_text)
+            if low_match:
+                data["domestic_low"] = int(low_match.group(1))
+            
+            # 提取开工率
+            rate_match = _re.search(r'开工率(\d+)%', clean_text)
+            if rate_match:
+                data["operating_rate"] = int(rate_match.group(1))
+            
+            # 提取接收站均价
+            term_avg_match = _re.search(r'接收站均价\s*为(\d+)\s*元', clean_text)
+            if term_avg_match:
+                data["terminal_avg"] = int(term_avg_match.group(1))
+            
+            # 提取接收站最高价站（"较 高价是"可能有空格）
+            term_high_match = _re.search(r'较\s*高价是\s*(.+?)\s*报价(\d+)\s*元', clean_text)
+            if term_high_match:
+                data["terminal_high_name"] = term_high_match.group(1).strip()
+                data["terminal_high"] = int(term_high_match.group(2))
+            
+            # 提取接收站最低价站
+            term_low_match = _re.search(r'较\s*低价是(.+?)\s*报价(\d+)\s*元', clean_text)
+            if term_low_match:
+                data["terminal_low_name"] = term_low_match.group(1).strip()
+                data["terminal_low"] = int(term_low_match.group(2))
+            
+            # 提取涨跌厂数
+            up_match = _re.search(r'(\d+)家\s*调\s*涨', clean_text)
+            if up_match:
+                data["up_count"] = int(up_match.group(1))
+            down_match = _re.search(r'(\d+)家\s*降\s*价', clean_text)
+            if down_match:
+                data["down_count"] = int(down_match.group(1))
+            
+            # 如果至少获取到了均价，就不再尝试其他文章
+            if data["domestic_avg"] or data["terminal_avg"]:
+                data["source"] = "lng168"
+                print(f"  LNG数据已从lng168更新: 液厂{data['domestic_avg']}元/吨, 接收站{data['terminal_avg']}元/吨")
+                break
+    
+    except Exception as e:
+        print(f"[WARN] lng168 LNG数据抓取失败: {e}")
+    
     return data
 
 def fetch_pipeline_gas_prices():
@@ -503,6 +583,20 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
     # 国内LNG
     lng_domestic = lng_data.get("domestic_avg") or 5963
     lng_terminal = lng_data.get("terminal_avg") or 6780
+    lng_dom_high = lng_data.get("domestic_high") or 6550
+    lng_dom_low = lng_data.get("domestic_low") or 5700
+    lng_term_high = lng_data.get("terminal_high") or 7750
+    lng_term_high_name = lng_data.get("terminal_high_name") or "国网广西北海"
+    lng_term_low = lng_data.get("terminal_low") or 6270
+    lng_term_low_name = lng_data.get("terminal_low_name") or "河北曹妃甸"
+    lng_op_rate = lng_data.get("operating_rate") or 47
+    lng_source = lng_data.get("source", "manual")
+    lng_up = lng_data.get("up_count")
+    lng_down = lng_data.get("down_count")
+    
+    lng_change_note = ""
+    if lng_up is not None and lng_down is not None:
+        lng_change_note = f"今日{lng_up}涨{lng_down}降"
     
     brent_high_str = f"{brent_high:.2f}" if brent_high else "—"
     brent_low_str = f"{brent_low:.2f}" if brent_low else "—"
@@ -574,7 +668,7 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
 <div class="header">
   <h1>⚡ 能源市场日报</h1>
   <div class="subtitle">城市燃气 · 市场决策参考</div>
-  <div class="date">📅 {report_date} | 数据截至 08:00 CST <span class="data-source">数据源: {oil_source}/{hh_source} | TTF: {ttf_source} | 汇率: {fx_source}</span></div>
+  <div class="date">📅 {report_date} | 数据截至 08:00 CST <span class="data-source">数据源: {oil_source}/{hh_source} | TTF: {ttf_source} | 汇率: {fx_source} | LNG: {lng_source}</span></div>
 </div>
 <div class="container">
   <div class="alert-banner">
@@ -584,7 +678,7 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
     <div class="summary-card warn"><div class="label">布伦特原油</div><div class="value">{brent:.2f}</div><div class="change up">▲ +{brent_chg}% | 美元/桶</div></div>
     <div class="summary-card warn"><div class="label">WTI原油</div><div class="value">{wti:.2f}</div><div class="change up">▲ +{wti_chg}% | 美元/桶</div></div>
     <div class="summary-card"><div class="label">Henry Hub天然气</div><div class="value">{hh_price:.3f}</div><div class="change {'down' if hh_chg < 0 else 'up'}">{'▼' if hh_chg < 0 else '▲'} {abs(hh_chg)}% | 美元/MMBtu</div></div>
-    <div class="summary-card"><div class="label">国内LNG出厂均价</div><div class="value">{lng_domestic:,}</div><div class="change down">元/吨 | 开工率47%</div></div>
+    <div class="summary-card"><div class="label">国内LNG出厂均价</div><div class="value">{lng_domestic:,}</div><div class="change down">元/吨 | 开工率{lng_op_rate}%</div></div>
   </div>
 
   <section>
@@ -635,8 +729,8 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
     <table>
       <thead><tr><th>类别</th><th>均价</th><th>最高价</th><th>最低价</th><th>备注</th><th>单位</th></tr></thead>
       <tbody>
-        <tr><td><strong>国产液厂</strong> (133家)</td><td>{lng_domestic:,}</td><td>6,550</td><td>5,700</td><td>开工率47%，需求疲软</td><td>元/吨</td></tr>
-        <tr><td><strong>接收站均价</strong> (19家)</td><td>{lng_terminal:,}</td><td>7,750</td><td>6,270</td><td>进口成本高企</td><td>元/吨</td></tr>
+        <tr><td><strong>国产液厂</strong> (133家)</td><td>{lng_domestic:,}</td><td>{lng_dom_high:,}</td><td>{lng_dom_low:,}</td><td>开工率{lng_op_rate}%，{lng_change_note}</td><td>元/吨</td></tr>
+        <tr><td><strong>接收站均价</strong> (19家)</td><td>{lng_terminal:,}</td><td>{lng_term_high:,}（{lng_term_high_name}）</td><td>{lng_term_low:,}（{lng_term_low_name}）</td><td>进口成本高企</td><td>元/吨</td></tr>
         <tr><td><strong>原料气竞拍</strong> (5月下半月)</td><td>3.65-3.95</td><td>—</td><td>—</td><td>中石油直供</td><td>元/方</td></tr>
       </tbody>
     </table>

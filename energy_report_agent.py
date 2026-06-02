@@ -73,58 +73,189 @@ def http_get(url, headers=None, timeout=15):
         print(f"[WARN] HTTP请求失败 {url}: {e}")
         return None
 
+def parse_stooq_csv(text):
+    """解析Stooq返回的CSV格式数据，返回结构化字典"""
+    import csv as _csv
+    import io as _io
+    if not text:
+        return None
+    reader = _csv.DictReader(_io.StringIO(text.strip()))
+    for row in reader:
+        if row.get("Close") and row["Close"] != "N/D":
+            return {
+                "open": float(row["Open"]) if row["Open"] != "N/D" else None,
+                "high": float(row["High"]) if row["High"] != "N/D" else None,
+                "low": float(row["Low"]) if row["Low"] != "N/D" else None,
+                "close": float(row["Close"]) if row["Close"] != "N/D" else None,
+                "volume": int(row["Volume"]) if row.get("Volume") and row["Volume"] not in ("N/D", "") else None,
+            }
+    return None
+
+
+def fetch_from_stooq(symbol):
+    """从Stooq获取单个品种的价格数据"""
+    url = f"https://stooq.com/q/l/?s={symbol}&f=sd2t2ohlcv&h&e=csv"
+    text = http_get(url)
+    return parse_stooq_csv(text)
+
+
+def fetch_from_exchangerate():
+    """从ExchangeRate-API获取USD/CNY汇率（备用汇率源）"""
+    try:
+        url = "https://open.er-api.com/v6/latest/USD"
+        text = http_get(url)
+        if text:
+            data = json.loads(text)
+            cny = data.get("rates", {}).get("CNY")
+            if cny:
+                return cny
+    except Exception as e:
+        print(f"[WARN] ExchangeRate-API失败: {e}")
+    return None
+
+
 def fetch_oil_prices():
     """
     采集国际油价
-    来源：尝试多个数据源
+    数据源优先级: Stooq(主力) -> 东方财富(备用)
     """
-    data = {"brent": None, "wti": None, "brent_change": None, "wti_change": None, "source": "manual"}
-    
-    # 尝试从东方财富API获取
+    data = {"brent": None, "wti": None, "brent_change": None, "wti_change": None,
+            "brent_high": None, "brent_low": None, "wti_high": None, "wti_low": None,
+            "source": "manual"}
+
+    # 主力数据源: Stooq
     try:
-        # 布伦特原油
-        brent_url = "https://push2.eastmoney.com/api/qt/stock/get?secid=113.B00Y&fields=f43,f44,f45,f46,f47,f48,f169,f170"
-        resp = http_get(brent_url)
-        if resp:
-            brent_json = json.loads(resp)
-            if brent_json.get("data"):
-                d = brent_json["data"]
-                data["brent"] = d.get("f43", 0) / 100 if d.get("f43") else None
-                data["brent_change"] = d.get("f169", 0) / 100 if d.get("f169") else None
-                data["source"] = "eastmoney"
+        brent_s = fetch_from_stooq("cb.f")
+        if brent_s and brent_s["close"]:
+            data["brent"] = brent_s["close"]
+            data["brent_high"] = brent_s["high"]
+            data["brent_low"] = brent_s["low"]
+            if brent_s["open"] and brent_s["open"] > 0:
+                data["brent_change"] = (brent_s["close"] - brent_s["open"]) / brent_s["open"] * 100
+            data["source"] = "stooq"
+
+        wti_s = fetch_from_stooq("cl.f")
+        if wti_s and wti_s["close"]:
+            data["wti"] = wti_s["close"]
+            data["wti_high"] = wti_s["high"]
+            data["wti_low"] = wti_s["low"]
+            if wti_s["open"] and wti_s["open"] > 0:
+                data["wti_change"] = (wti_s["close"] - wti_s["open"]) / wti_s["open"] * 100
+            if data["source"] == "manual":
+                data["source"] = "stooq"
     except Exception as e:
-        print(f"[WARN] 东方财富布伦特API失败: {e}")
-    
-    try:
-        # WTI原油
-        wti_url = "https://push2.eastmoney.com/api/qt/stock/get?secid=113.CL00Y&fields=f43,f44,f45,f46,f47,f48,f169,f170"
-        resp = http_get(wti_url)
-        if resp:
-            wti_json = json.loads(resp)
-            if wti_json.get("data"):
-                d = wti_json["data"]
-                data["wti"] = d.get("f43", 0) / 100 if d.get("f43") else None
-                data["wti_change"] = d.get("f169", 0) / 100 if d.get("f169") else None
-    except Exception as e:
-        print(f"[WARN] 东方财富WTI API失败: {e}")
-    
+        print(f"[WARN] Stooq原油API失败: {e}")
+
+    # 备用数据源: 东方财富
+    if data["brent"] is None:
+        try:
+            brent_url = "https://push2.eastmoney.com/api/qt/stock/get?secid=113.B00Y&fields=f43,f44,f45,f46,f47,f48,f169,f170"
+            resp = http_get(brent_url)
+            if resp:
+                brent_json = json.loads(resp)
+                if brent_json.get("data"):
+                    d = brent_json["data"]
+                    data["brent"] = d.get("f43", 0) / 100 if d.get("f43") else None
+                    data["brent_change"] = d.get("f169", 0) / 100 if d.get("f169") else None
+                    data["source"] = "eastmoney"
+        except Exception as e:
+            print(f"[WARN] 东方财富布伦特API失败: {e}")
+
+    if data["wti"] is None:
+        try:
+            wti_url = "https://push2.eastmoney.com/api/qt/stock/get?secid=113.CL00Y&fields=f43,f44,f45,f46,f47,f48,f169,f170"
+            resp = http_get(wti_url)
+            if resp:
+                wti_json = json.loads(resp)
+                if wti_json.get("data"):
+                    d = wti_json["data"]
+                    data["wti"] = d.get("f43", 0) / 100 if d.get("f43") else None
+                    data["wti_change"] = d.get("f169", 0) / 100 if d.get("f169") else None
+                    if data["source"] == "manual":
+                        data["source"] = "eastmoney"
+        except Exception as e:
+            print(f"[WARN] 东方财富WTI API失败: {e}")
+
     return data
 
 def fetch_henry_hub():
     """采集Henry Hub天然气期货价格"""
-    data = {"price": None, "change_pct": None, "source": "manual"}
+    data = {"price": None, "change_pct": None, "high": None, "low": None, "source": "manual"}
+
+    # 主力数据源: Stooq
     try:
-        url = "https://push2.eastmoney.com/api/qt/stock/get?secid=113.NG00Y&fields=f43,f44,f45,f46,f47,f48,f169,f170"
-        resp = http_get(url)
-        if resp:
-            j = json.loads(resp)
-            if j.get("data"):
-                d = j["data"]
-                data["price"] = d.get("f43", 0) / 100 if d.get("f43") else None
-                data["change_pct"] = d.get("f169", 0) / 100 if d.get("f169") else None
-                data["source"] = "eastmoney"
+        hh = fetch_from_stooq("ng.f")
+        if hh and hh["close"]:
+            data["price"] = hh["close"]
+            data["high"] = hh["high"]
+            data["low"] = hh["low"]
+            if hh["open"] and hh["open"] > 0:
+                data["change_pct"] = (hh["close"] - hh["open"]) / hh["open"] * 100
+            data["source"] = "stooq"
     except Exception as e:
-        print(f"[WARN] Henry Hub API失败: {e}")
+        print(f"[WARN] Stooq Henry Hub API失败: {e}")
+
+    # 备用数据源: 东方财富
+    if data["price"] is None:
+        try:
+            url = "https://push2.eastmoney.com/api/qt/stock/get?secid=113.NG00Y&fields=f43,f44,f45,f46,f47,f48,f169,f170"
+            resp = http_get(url)
+            if resp:
+                j = json.loads(resp)
+                if j.get("data"):
+                    d = j["data"]
+                    data["price"] = d.get("f43", 0) / 100 if d.get("f43") else None
+                    data["change_pct"] = d.get("f169", 0) / 100 if d.get("f169") else None
+                    data["source"] = "eastmoney"
+        except Exception as e:
+            print(f"[WARN] 东方财富Henry Hub API失败: {e}")
+
+    return data
+
+
+def fetch_ttf_price():
+    """采集TTF天然气期货价格（欧洲基准）"""
+    data = {"price": None, "change_pct": None, "high": None, "low": None, "source": "manual"}
+
+    # 数据源: Stooq（TTF代码: tg.f）
+    try:
+        ttf = fetch_from_stooq("tg.f")
+        if ttf and ttf["close"]:
+            data["price"] = ttf["close"]
+            data["high"] = ttf["high"]
+            data["low"] = ttf["low"]
+            if ttf["open"] and ttf["open"] > 0:
+                data["change_pct"] = (ttf["close"] - ttf["open"]) / ttf["open"] * 100
+            data["source"] = "stooq"
+    except Exception as e:
+        print(f"[WARN] Stooq TTF API失败: {e}")
+
+    return data
+
+
+def fetch_usdcny_rate():
+    """采集美元/人民币汇率"""
+    data = {"rate": None, "source": "manual"}
+
+    # 主力数据源: ExchangeRate-API（JSON格式，更易解析）
+    try:
+        rate = fetch_from_exchangerate()
+        if rate:
+            data["rate"] = rate
+            data["source"] = "exchangerate-api"
+    except Exception as e:
+        print(f"[WARN] ExchangeRate-API失败: {e}")
+
+    # 备用数据源: Stooq（离岸汇率）
+    if data["rate"] is None:
+        try:
+            fx = fetch_from_stooq("usdcny")
+            if fx and fx["close"]:
+                data["rate"] = fx["close"]
+                data["source"] = "stooq"
+        except Exception as e:
+            print(f"[WARN] Stooq USD/CNY失败: {e}")
+
     return data
 
 def fetch_lng_prices():
@@ -331,7 +462,7 @@ def generate_terminal_tables(lng_data):
     return "".join(html_parts)
 
 
-def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pipe_data, news_data, insights_data=None):
+def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pipe_data, news_data, insights_data=None, ttf_data=None, fx_data=None):
     """生成完整的HTML日报"""
     
     if insights_data is None:
@@ -340,17 +471,43 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
     gas_insight = insights_data.get("gas_intl", {})
     lng_insight = insights_data.get("lng_domestic", {})
     
-    # 使用手动填充的默认数据（当API获取失败时）
+    # 国际油价
     brent = oil_data.get("brent") or 95.31
     wti = oil_data.get("wti") or 94.59
     brent_chg = oil_data.get("brent_change") or 2.6
     wti_chg = oil_data.get("wti_change") or 2.7
+    brent_high = oil_data.get("brent_high")
+    brent_low = oil_data.get("brent_low")
+    wti_high = oil_data.get("wti_high")
+    wti_low = oil_data.get("wti_low")
+    
+    # 国际天然气
     hh_price = hh_data.get("price") or 3.079
     hh_chg = hh_data.get("change_pct") or -0.52
+    hh_high = hh_data.get("high")
+    hh_low = hh_data.get("low")
+    
+    # TTF
+    ttf_price = (ttf_data or {}).get("price") or 58.50
+    ttf_chg = (ttf_data or {}).get("change_pct") or 1.2
+    ttf_source = (ttf_data or {}).get("source", "manual")
+    
+    # 汇率
+    usdcny = (fx_data or {}).get("rate") or 6.8240
+    fx_source = (fx_data or {}).get("source", "manual")
+    
+    # JKM
     jkm = jkm_data.get("price") or 19.04
     jkm_chg = jkm_data.get("change_pct") or 13.6
+    
+    # 国内LNG
     lng_domestic = lng_data.get("domestic_avg") or 5963
     lng_terminal = lng_data.get("terminal_avg") or 6780
+    
+    brent_high_str = f"{brent_high:.2f}" if brent_high else "—"
+    brent_low_str = f"{brent_low:.2f}" if brent_low else "—"
+    wti_high_str = f"{wti_high:.2f}" if wti_high else "—"
+    wti_low_str = f"{wti_low:.2f}" if wti_low else "—"
     
     oil_source = oil_data.get("source", "manual")
     hh_source = hh_data.get("source", "manual")
@@ -417,7 +574,7 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
 <div class="header">
   <h1>⚡ 能源市场日报</h1>
   <div class="subtitle">城市燃气 · 市场决策参考</div>
-  <div class="date">📅 {report_date} | 数据截至 08:00 CST <span class="data-source">数据源: {oil_source}/{hh_source}</span></div>
+  <div class="date">📅 {report_date} | 数据截至 08:00 CST <span class="data-source">数据源: {oil_source}/{hh_source} | TTF: {ttf_source} | 汇率: {fx_source}</span></div>
 </div>
 <div class="container">
   <div class="alert-banner">
@@ -435,8 +592,8 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
     <table>
       <thead><tr><th>品种</th><th>最新价</th><th>涨跌幅</th><th>日内高</th><th>日内低</th><th>单位</th></tr></thead>
       <tbody>
-        <tr><td><strong>布伦特原油 (ICE)</strong></td><td style="color:#e74c3c;font-weight:700;">{brent:.2f}</td><td><span class="tag tag-red">+{brent_chg}%</span></td><td>—</td><td>—</td><td>美元/桶</td></tr>
-        <tr><td><strong>WTI原油 (NYMEX)</strong></td><td style="color:#e74c3c;font-weight:700;">{wti:.2f}</td><td><span class="tag tag-red">+{wti_chg}%</span></td><td>—</td><td>—</td><td>美元/桶</td></tr>
+        <tr><td><strong>布伦特原油 (ICE)</strong></td><td style="color:#e74c3c;font-weight:700;">{brent:.2f}</td><td><span class="tag tag-red">+{brent_chg:.2f}%</span></td><td>{brent_high_str}</td><td>{brent_low_str}</td><td>美元/桶</td></tr>
+        <tr><td><strong>WTI原油 (NYMEX)</strong></td><td style="color:#e74c3c;font-weight:700;">{wti:.2f}</td><td><span class="tag tag-red">+{wti_chg:.2f}%</span></td><td>{wti_high_str}</td><td>{wti_low_str}</td><td>美元/桶</td></tr>
         <tr><td><strong>WTI-Brent价差</strong></td><td>{wti-brent:.2f}</td><td><span class="tag tag-blue">—</span></td><td>—</td><td>—</td><td>美元/桶</td></tr>
       </tbody>
     </table>
@@ -457,7 +614,7 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
       <thead><tr><th>品种</th><th>最新价</th><th>涨跌幅</th><th>备注</th><th>单位</th></tr></thead>
       <tbody>
         <tr><td><strong>Henry Hub (NYMEX)</strong></td><td>{hh_price:.3f}</td><td><span class="tag {'tag-green' if hh_chg < 0 else 'tag-red'}">{hh_chg:+.2f}%</span></td><td>北美供需平衡</td><td>美元/MMBtu</td></tr>
-        <tr><td><strong>TTF (荷兰)</strong></td><td>58.50</td><td><span class="tag tag-red">+1.2%</span></td><td>欧洲库存偏低</td><td>欧元/兆瓦时</td></tr>
+        <tr><td><strong>TTF (荷兰)</strong></td><td>{ttf_price:.2f}</td><td><span class="tag {'tag-green' if ttf_chg < 0 else 'tag-red'}">{ttf_chg:+.2f}%</span></td><td>欧洲库存偏低</td><td>欧元/兆瓦时</td></tr>
         <tr><td><strong>JKM东北亚现货</strong></td><td>{jkm:.2f}</td><td><span class="tag tag-red">+{jkm_chg}%</span></td><td>地缘溢价维持高位</td><td>美元/MMBtu</td></tr>
         <tr><td><strong>中国LNG到岸价 (DES)</strong></td><td>18.50</td><td><span class="tag tag-red">+10.8%</span></td><td>跟随JKM联动</td><td>美元/MMBtu</td></tr>
       </tbody>
@@ -787,10 +944,16 @@ def main():
     print("\n[1/4] 采集数据中...")
     oil_data = fetch_oil_prices()
     print(f"  国际油价: 布伦特={oil_data.get('brent')}, WTI={oil_data.get('wti')} (来源: {oil_data['source']})")
-    
+
     hh_data = fetch_henry_hub()
     print(f"  Henry Hub: {hh_data.get('price')} (来源: {hh_data['source']})")
-    
+
+    ttf_data = fetch_ttf_price()
+    print(f"  TTF天然气: {ttf_data.get('price')} (来源: {ttf_data['source']})")
+
+    fx_data = fetch_usdcny_rate()
+    print(f"  USD/CNY汇率: {fx_data.get('rate')} (来源: {fx_data['source']})")
+
     jkm_data = fetch_jkm_price()
     print(f"  JKM现货: {jkm_data.get('price')} (来源: {jkm_data['source']})")
     
@@ -808,7 +971,7 @@ def main():
     
     # 2. 生成报告
     print("\n[2/4] 生成HTML报告...")
-    html_content = generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pipe_data, news_data, insights_data)
+    html_content = generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pipe_data, news_data, insights_data, ttf_data, fx_data)
     
     # 3. 保存HTML + 生成PDF
     print("\n[3/4] 保存报告 & 生成PDF...")

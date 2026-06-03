@@ -6,6 +6,11 @@ on:
     - cron: "0 0 * * *"
     - cron: "5 0 * * *"
   workflow_dispatch:  # 允许手动触发
+  push:
+    branches: [main]
+    paths:
+      - 'energy_report_agent.py'
+      - '.github/workflows/daily-report.yml'
 
 jobs:
   generate-report:

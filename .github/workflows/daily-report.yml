@@ -7,10 +7,9 @@ on:
     - cron: "5 0 * * *"
   workflow_dispatch:  # 允许手动触发
   push:
-    branches: [main]
     paths:
-      - 'energy_report_agent.py'
-      - '.github/workflows/daily-report.yml'
+      - "energy_report_agent.py"
+      - ".github/workflows/daily-report.yml"
 
 jobs:
   generate-report:
@@ -51,82 +50,3 @@ jobs:
           name: daily-report-${{ github.run_id }}
           path: reports/
           retention-days: 7
-
-  test-sci99:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    needs: generate-report
-
-    steps:
-      - name: 测试卓创资讯登录
-        env:
-          SCI99_USER: ${{ secrets.SCI99_USER }}
-          SCI99_PASS: ${{ secrets.SCI99_PASS }}
-        run: |
-          python3 << 'PYEOF'
-import urllib.request, urllib.parse, http.cookiejar, json, ssl, re, os
-
-cj = http.cookiejar.CookieJar()
-opener = urllib.request.build_opener(
-    urllib.request.HTTPSHandler(context=ssl.create_default_context()),
-    urllib.request.HTTPCookieProcessor(cj)
-)
-
-user = os.environ.get('SCI99_USER', '')
-pwd = os.environ.get('SCI99_PASS', '')
-print(f'[INFO] 已读取账号: {"***" if user else "未配置"}')
-
-# 1. DNS测试
-print("\n=== DNS解析 ===")
-for host in ['passport.sci99.com', 'energy.sci99.com', 'prices.sci99.com']:
-    try:
-        import socket
-        ip = socket.getaddrinfo(host, 443)[0][4][0]
-        print(f'  {host} -> {ip} ✅')
-    except Exception as e:
-        print(f'  {host} -> ❌ {e}')
-
-# 2. HTTPS连通
-print("\n=== HTTPS连通 ===")
-for url in ['https://passport.sci99.com/', 'https://energy.sci99.com/']:
-    try:
-        resp = opener.open(url, timeout=10)
-        print(f'  {url} -> HTTP {resp.status} ✅')
-    except Exception as e:
-        print(f'  {url} -> ❌ {str(e)[:120]}')
-
-# 3. 登录
-print("\n=== 登录测试 ===")
-login_url = 'https://passport.sci99.com/api/login'
-login_data = urllib.parse.urlencode({'username': user, 'password': pwd}).encode()
-req = urllib.request.Request(login_url, data=login_data, headers={
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    'Content-Type': 'application/x-www-form-urlencoded',
-    'Referer': 'https://energy.sci99.com/',
-    'Origin': 'https://energy.sci99.com',
-})
-try:
-    resp = opener.open(req, timeout=15)
-    result = json.loads(resp.read().decode())
-    print(f'  登录响应: {json.dumps(result, ensure_ascii=False)[:300]}')
-    if isinstance(result, dict) and result.get('code') == 0:
-        print('  ✅ 登录成功!')
-    else:
-        print(f'  ⚠️ 登录返回: {result}')
-except Exception as e:
-    print(f'  ❌ 登录失败: {str(e)[:200]}')
-
-# 4. 抓取LNG页面
-print("\n=== LNG数据抓取 ===")
-try:
-    lng_page = opener.open('https://energy.sci99.com/product/lng', timeout=15).read().decode()
-    login_text = '退出' if '退出' in lng_page else ('登录' if '登录' in lng_page else '未知')
-    print(f'  页面长度: {len(lng_page)} 字节')
-    print(f'  登录状态: {login_text}')
-    prices = re.findall(r'\d{3,5}\s*元', lng_page)[:10]
-    print(f'  价格数据: {prices}')
-except Exception as e:
-    print(f'  ❌ LNG页面失败: {str(e)[:200]}')
-
-print("\n=== 测试完成 ===")
-PYEOF

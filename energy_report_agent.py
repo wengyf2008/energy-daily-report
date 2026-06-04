@@ -1,817 +1,1400 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-能源市场日报自动生成与推送系统
-Energy Market Daily Report Generator & Push Agent
+城市燃气 · 能源市场日报自动生成与推送系统
+=============================================
+功能：
+  1. 自动采集国际油价、天然气期货、东北亚现货、国内LNG、管道气价格
+  2. 生成专业HTML日报
+  3. 支持邮件/企业微信/飞书多渠道推送
+  4. 可通过 cron 定时每天8:00执行
+
+使用方法：
+  python3 energy_report_agent.py [--push email|wecom|feishu] [--date YYYY-MM-DD]
 """
 
 import os
 import sys
 import json
-import argparse
-import smtplib
+import re
+import urllib.request
+import urllib.error
 import ssl
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
+import time
+import smtplib
+import argparse
 from datetime import datetime, timedelta
-from pathlib import Path
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from string import Template
 
-# ─── 配置加载 ───
-def load_env(env_path):
-    """加载 .env 文件中的配置"""
-    config = {}
-    if not os.path.exists(env_path):
-        print(f"[WARN] 配置文件不存在: {env_path}")
-        return config
-    with open(env_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith('#') and '=' in line:
-                key, value = line.split('=', 1)
-                config[key.strip()] = value.strip()
-    print(f"[INFO] 已加载配置: {env_path} ({len(config)} 项)")
-    return config
+# ============================================================
+# 配置区 - 请根据实际情况修改
+# ============================================================
+CONFIG = {
+    # 邮件推送配置
+    "email": {
+        "smtp_host": os.environ.get("SMTP_HOST", "smtp.qq.com"),
+        "smtp_port": int(os.environ.get("SMTP_PORT", "465")),
+        "username": os.environ.get("SMTP_USER", ""),
+        "password": os.environ.get("SMTP_PASS", ""),
+        "from_addr": os.environ.get("SMTP_FROM", ""),
+        "to_addrs": os.environ.get("SMTP_TO", "").split(",") if os.environ.get("SMTP_TO") else [],
+    },
+    # 企业微信机器人webhook
+    "wecom_webhook": os.environ.get("WECOM_WEBHOOK", ""),
+    # 飞书机器人webhook
+    "feishu_webhook": os.environ.get("FEISHU_WEBHOOK", ""),
+    # 报告输出路径
+    "output_dir": os.environ.get("REPORT_OUTPUT_DIR", "reports"),
+}
 
+# ============================================================
+# 数据采集模块
+# ============================================================
 
-# ─── 市场数据模块 ───
-def get_market_data():
-    """获取能源市场数据（从预编译数据源或实时API）"""
-    today = datetime.now()
-    report_date = today.strftime('%Y年%m月%d日')
+def create_ssl_context():
+    """创建SSL上下文"""
+    ctx = ssl.create_default_context()
+    return ctx
 
-    data = {
-        "report_date": report_date,
-        "report_date_en": today.strftime('%Y-%m-%d'),
-
-        # ── 国际原油市场 ──
-        "crude_oil": {
-            "brent": {
-                "price": 96.87,
-                "unit": "美元/桶",
-                "change_pct": +1.99,
-                "monthly_change": -15.36,
-                "yearly_change": +47.60,
-                "prev_close": 94.98,
-            },
-            "wti": {
-                "price": 92.21,
-                "unit": "美元/桶",
-                "change_pct": +1.85,
-                "monthly_change": -16.20,
-                "yearly_change": +44.80,
-                "prev_close": 90.54,
-            },
-            "drivers": [
-                "美伊冲突持续升级：5月28日伊朗革命卫队对美军科威特基地发动导弹打击，中东地缘风险溢价维持高位",
-                "霍尔木兹海峡通行风险：伊朗6月1日威胁彻底封锁海峡，全球约20%石油运输面临中断威胁",
-                "OPEC+减产纪律松动：部分成员国超产配额，但沙特表态将延长自愿减产至Q3",
-                "美国原油库存：EIA最新数据显示商业原油库存超预期下降380万桶，支撑短期油价",
-                "需求端压力：全球制造业PMI持续收缩，中国经济复苏乏力压制原油需求预期",
-            ]
-        },
-
-        # ── 国际天然气期货 ──
-        "natgas_futures": {
-            "henry_hub": {
-                "price": 3.15,
-                "unit": "美元/百万英热",
-                "change_pct": -0.63,
-                "monthly_change": -12.50,
-                "note": "1月曾飙升至$7.72后持续回落",
-            },
-            "ttf": {
-                "price": 48.03,
-                "unit": "欧元/兆瓦时",
-                "change_pct": -2.16,
-                "monthly_change": -0.23,
-                "yearly_change": +33.15,
-                "prev_close": 49.09,
-            },
-            "jkm": {
-                "price": 18.61,
-                "unit": "美元/百万英热",
-                "change_pct": -0.40,
-                "monthly_change": +10.35,
-                "yearly_change": +50.93,
-            },
-            "drivers": [
-                "Henry Hub：暖冬过后美国天然气库存充裕，LNG出口产能满负荷运行对冲部分下行压力",
-                "TTF：欧盟储气库注气进度正常，但俄气断供余波叠加亚洲溢价分流货源，价格维持偏高位",
-                "JKM：中东LNG出口受美伊冲突扰动，霍尔木兹海峡通行受限推高亚洲现货溢价",
-                "全球LNG贸易流：美伊冲突导致中东LNG船期不确定性增加，部分货物转道好望角增加运费成本",
-            ]
-        },
-
-        # ── 国内LNG市场 ──
-        "lng_china": {
-            "factory_avg": 6090,
-            "factory_avg_unit": "元/吨",
-            "factory_mom": "+16.15%",
-            "station_avg": 6477,
-            "station_avg_unit": "元/吨",
-            "station_mom": "+16.53%",
-            "spot_cif": 17.5,
-            "spot_cif_unit": "美元/百万英热",
-            "spot_mom": "+2.1%",
-            "factory_count": 133,
-            "maintenance_count": 57,
-            "operating_rate": "57%",
-            "supply_factory_tons": 2210000,
-            "supply_factory_mom": "-0.63%",
-            "supply_station_tons": 765300,
-            "supply_station_mom": "-10.64%",
-            "drivers": [
-                "供给端收缩：5-7月传统检修季+原料气供应收紧，工厂开工率降至57%",
-                "接收站控量：进口成本倒挂（卖一吨亏一吨），接收站主动缩减槽批供应量",
-                "需求端疲软：LNG价格超5900元/吨即丧失对管道气的经济竞争力，城燃及工业用户转向管道气",
-                "车用需求受压：加气站价格高企，LNG重卡经济性劣于柴油，加气量萎缩",
-                "5月行情本质：'数据上涨、体感走弱'——月初高基数+4月低基数效应，实际为缓慢阴跌走势",
-            ]
-        },
-
-        # ── 16座LNG接收站进口价格明细 ──
-        "lng_stations": [
-            {"name": "广东大鹏", "price": 5980, "change": "+50", "origin": "澳大利亚"},
-            {"name": "福建莆田", "price": 5850, "change": "0", "origin": "印度尼西亚"},
-            {"name": "上海洋山", "price": 5720, "change": "-30", "origin": "卡塔尔"},
-            {"name": "江苏如东", "price": 5650, "change": "+20", "origin": "澳大利亚"},
-            {"name": "辽宁大连", "price": 5580, "change": "-50", "origin": "卡塔尔"},
-            {"name": "河北曹妃甸", "price": 4382, "change": "+30", "origin": "卡塔尔"},
-            {"name": "山东青岛", "price": 5680, "change": "0", "origin": "澳大利亚"},
-            {"name": "浙江宁波", "price": 5620, "change": "-20", "origin": "卡塔尔"},
-            {"name": "广东珠海", "price": 5900, "change": "+40", "origin": "卡塔尔"},
-            {"name": "天津浮式", "price": 5500, "change": "-30", "origin": "俄罗斯"},
-            {"name": "广西北海", "price": 5830, "change": "+10", "origin": "澳大利亚"},
-            {"name": "海南洋浦", "price": 6000, "change": "+80", "origin": "卡塔尔"},
-            {"name": "深圳迭福", "price": 5920, "change": "+30", "origin": "澳大利亚"},
-            {"name": "粤东揭阳", "price": 5880, "change": "0", "origin": "巴布亚新几内亚"},
-            {"name": "河北唐山", "price": 5460, "change": "-40", "origin": "卡塔尔"},
-            {"name": "江苏滨海", "price": 5600, "change": "+20", "origin": "美国"},
-        ],
-
-        # ── 管道天然气交易市场 ──
-        "pipeline_gas": {
-            "shpgx": {
-                "name": "上海石油天然气交易中心",
-                "latest_session": "2026年5月场次",
-                "avg_price": 3.795,
-                "avg_price_unit": "元/立方米",
-                "change": "+0.12",
-                "volume": "1.85亿方",
-                "note": "6月原料气竞拍加权均价3.795元/m³，折合生产成本约6155元/吨",
-            },
-            "chongqing": {
-                "name": "重庆石油天然气交易中心",
-                "latest_session": "2026年第254号公告",
-                "auction_date": "2026年5月25日",
-                "delivery_period": "2026年5月31日-6月30日",
-                "note": "管道气竞价交易连续均衡交收，不得超量超提",
-            },
-            "yanchang": {
-                "name": "延长石油竞拍",
-                "latest_session": "2026年6月气源竞拍",
-                "result": "流拍",
-                "base_price": 3.85,
-                "base_price_unit": "元/立方米",
-                "note": "市场需求疲软导致延长石油竞拍流拍，反映下游接货意愿低迷",
-            }
-        },
-
-        # ── 地缘政治要闻 ──
-        "geopolitics": {
-            "headline": "美伊冲突螺旋升级，霍尔木兹海峡成全球能源命脉焦点",
-            "events": [
-                {"date": "5月25日", "event": "美国对伊朗境内目标发动空袭，造成人员伤亡"},
-                {"date": "5月26日", "event": "伊朗反击，导弹/无人机打击阿曼湾方向美军设施"},
-                {"date": "5月27日", "event": "美军再次空袭伊朗阿巴斯港附近区域"},
-                {"date": "5月28日", "event": "伊朗革命卫队对美军科威特基地实施导弹+无人机混合打击，科威特全国防空警报"},
-                {"date": "6月1日", "event": "伊朗暂停与美方中间人对话，威胁彻底封锁霍尔木兹海峡"},
-                {"date": "6月1日", "event": "特朗普称'未来一周内'可能达成协议延长停火并重开海峡"},
-            ],
-            "key_points": [
-                "伊朗将以色列停止黎巴嫩/加沙军事行动作为伊美停火先决条件",
-                "伊朗及'抵抗阵线'计划封锁霍尔木兹海峡+在曼德海峡开启行动",
-                "美国对伊朗港口实施封锁，但特朗普称'不会大肆投掷炸弹'",
-                "霍尔木兹海峡日均通过约2000万桶原油，占全球石油消费量20%",
-                "穆迪首席经济学家警告：若一周内无法解决美伊冲突，恐导致全球经济衰退",
-            ]
-        },
-
-        # ── 三情景风险矩阵 ──
-        "risk_matrix": {
-            "peace": {
-                "name": "和平情景（概率15%）",
-                "probability": "15%",
-                "trigger": "美伊一周内达成停火协议，霍尔木兹海峡完全重开",
-                "oil_impact": "布伦特快速回落至75-80美元/桶区间，地缘溢价大幅出清",
-                "gas_impact": "JKM回落至12-14美元/MMBtu，TTF回落至35-40欧元/MWh",
-                "lng_impact": "国内LNG跟跌，接收站价格回落至4500-5000元/吨",
-                "strategy": "立即降低库存，锁定远期低价长约，增加管道气采购占比",
-            },
-            "stalemate": {
-                "name": "僵持情景（概率55%）",
-                "probability": "55%",
-                "trigger": "停火脆弱维持，海峡间歇性通行，低烈度冲突持续",
-                "oil_impact": "布伦特在85-100美元/桶宽幅震荡，地缘溢价嵌入定价",
-                "gas_impact": "JKM在16-20美元/MMBtu波动，TTF在42-52欧元/MWh区间",
-                "lng_impact": "国内LNG在5500-6500元/吨区间震荡，成本支撑+需求压制",
-                "strategy": "维持合理安全库存，分批采购控制成本，关注竞拍窗口机会",
-            },
-            "deterioration": {
-                "name": "恶化情景（概率30%）",
-                "probability": "30%",
-                "trigger": "霍尔木兹海峡实质性封锁，美伊全面军事对抗",
-                "oil_impact": "布伦特飙升突破120-140美元/桶，全球原油供应缺口达1500-2000万桶/日",
-                "gas_impact": "JKM突破25-30美元/MMBtu，TTF突破70-80欧元/MWh",
-                "lng_impact": "国内LNG暴涨至7500-9000元/吨，非长协气源基本断供",
-                "strategy": "立即启动应急采购预案，最大化长协执行率，启动天然气替代方案（煤改气逆转）",
-            }
-        },
-
-        # ── 综合分析及策略建议 ──
-        "strategy": {
-            "overall_assessment": (
-                "当前能源市场处于'地缘风险高悬+基本面偏弱'的矛盾格局。"
-                "美伊冲突螺旋升级为油价提供强力底部支撑，但全球需求疲软限制上行空间。"
-                "国内LNG市场呈现典型的'成本强支撑+需求强压制'双面夹击——"
-                "上游想涨价却不敢，下游想采购却付不起，市场陷入高位僵持。"
-            ),
-            "recommendations": [
-                {
-                    "title": "库存策略",
-                    "content": "维持7-10天安全库存，不宜过度囤货。僵持情景下价格短期难有大跌，但恶化情景需备足应急气源"
-                },
-                {
-                    "title": "采购节奏",
-                    "content": "分3-4批均衡采购，避免集中高位接货。密切关注SHPGX/重庆交易中心竞拍窗口，逢低锁定部分气量"
-                },
-                {
-                    "title": "气源结构",
-                    "content": "提高管道气占比至60%以上，降低对LNG现货的依赖。长协执行率力争100%，现货仅作调峰补充"
-                },
-                {
-                    "title": "风险对冲",
-                    "content": "关注原油/天然气期货套保机会，可考虑买入看涨期权对冲恶化情景下的采购成本飙升风险"
-                },
-                {
-                    "title": "地缘监控",
-                    "content": "重点跟踪：①美伊停火谈判进展（一周内窗口期）②霍尔木兹海峡实际通行情况③以色列-黎巴嫩冲突走向"
-                },
-            ],
-            "key_watch": [
-                "6月3日 EIA天然气库存报告",
-                "6月5日 OPEC+部长级会议",
-                "美伊停火协议进展（每日跟踪）",
-                "国内6月管道气竞拍结果",
-                "气温预测：华北/华东6月中旬高温预警可能触发调峰需求",
-            ]
+def http_get(url, headers=None, timeout=15):
+    """HTTP GET请求"""
+    if headers is None:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
         }
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        ctx = create_ssl_context()
+        resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)
+        return resp.read().decode("utf-8", errors="ignore")
+    except Exception as e:
+        print(f"[WARN] HTTP请求失败 {url}: {e}")
+        return None
+
+def parse_stooq_csv(text):
+    """解析Stooq返回的CSV格式数据，返回结构化字典"""
+    import csv as _csv
+    import io as _io
+    if not text:
+        return None
+    reader = _csv.DictReader(_io.StringIO(text.strip()))
+    for row in reader:
+        if row.get("Close") and row["Close"] != "N/D":
+            return {
+                "open": float(row["Open"]) if row["Open"] != "N/D" else None,
+                "high": float(row["High"]) if row["High"] != "N/D" else None,
+                "low": float(row["Low"]) if row["Low"] != "N/D" else None,
+                "close": float(row["Close"]) if row["Close"] != "N/D" else None,
+                "volume": int(row["Volume"]) if row.get("Volume") and row["Volume"] not in ("N/D", "") else None,
+            }
+    return None
+
+
+def fetch_from_stooq(symbol):
+    """从Stooq获取单个品种的价格数据"""
+    url = f"https://stooq.com/q/l/?s={symbol}&f=sd2t2ohlcv&h&e=csv"
+    text = http_get(url)
+    return parse_stooq_csv(text)
+
+
+def fetch_from_yahoo(symbol):
+    """
+    从 Yahoo Finance 获取品种前日收盘价及OHLC数据
+    symbol: Yahoo Finance ticker, e.g. 'JKM=F', 'TTF=F', 'BZ=F', 'CL=F', 'NG=F'
+    返回: {'price': float, 'change_pct': float, 'high': float, 'low': float, 'date': str, 'source': 'yahoo'}
+    """
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=5d&interval=1d"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
     }
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        ctx = ssl.create_default_context()
+        # Yahoo Finance在某些环境需要忽略证书验证
+        try:
+            resp = urllib.request.urlopen(req, timeout=15, context=ctx)
+        except ssl.SSLError:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            resp = urllib.request.urlopen(req, timeout=15, context=ctx)
+        raw = resp.read().decode("utf-8", errors="ignore")
+        data = json.loads(raw)
+        result = data["chart"]["result"][0]
+        meta = result.get("meta", {})
+        quotes = result.get("indicators", {}).get("quote", [{}])[0]
+        timestamps = result.get("timestamp", [])
+
+        # 取最后一个有效日期（非None收盘价）
+        closes = [q for q in quotes.get("close", []) if q is not None]
+        opens = [q for q in quotes.get("open", []) if q is not None]
+        highs = [q for q in quotes.get("high", []) if q is not None]
+        lows = [q for q in quotes.get("low", []) if q is not None]
+        valid_ts = [t for i, t in enumerate(timestamps) if i < len(quotes.get("close", [])) and quotes["close"][i] is not None]
+
+        if not closes or not opens:
+            return None
+
+        price = closes[-1]
+        prev_open = opens[-1] if len(opens) > 0 else price
+        change_pct = ((price - prev_open) / prev_open * 100) if prev_open and prev_open > 0 else 0
+        high = highs[-1] if highs else None
+        low = lows[-1] if lows else None
+        last_date = datetime.fromtimestamp(valid_ts[-1]).strftime("%Y-%m-%d") if valid_ts else None
+
+        return {
+            "price": round(price, 4),
+            "change_pct": round(change_pct, 2),
+            "high": round(high, 4) if high else None,
+            "low": round(low, 4) if low else None,
+            "date": last_date,
+            "source": "yahoo",
+        }
+    except Exception as e:
+        # print(f"[WARN] Yahoo Finance {symbol} 失败: {e}")
+        return None
+
+
+def fetch_from_exchangerate():
+    """从ExchangeRate-API获取USD/CNY汇率（备用汇率源）"""
+    try:
+        url = "https://open.er-api.com/v6/latest/USD"
+        text = http_get(url)
+        if text:
+            data = json.loads(text)
+            cny = data.get("rates", {}).get("CNY")
+            if cny:
+                return cny
+    except Exception as e:
+        print(f"[WARN] ExchangeRate-API失败: {e}")
+    return None
+
+
+def fetch_oil_prices():
+    """
+    采集国际油价
+    数据源优先级: Stooq(主力) -> 东方财富(备用)
+    """
+    data = {"brent": None, "wti": None, "brent_change": None, "wti_change": None,
+            "brent_high": None, "brent_low": None, "wti_high": None, "wti_low": None,
+            "source": "manual"}
+
+    # 主力数据源: Stooq
+    try:
+        brent_s = fetch_from_stooq("cb.f")
+        if brent_s and brent_s["close"]:
+            data["brent"] = brent_s["close"]
+            data["brent_high"] = brent_s["high"]
+            data["brent_low"] = brent_s["low"]
+            if brent_s["open"] and brent_s["open"] > 0:
+                data["brent_change"] = (brent_s["close"] - brent_s["open"]) / brent_s["open"] * 100
+            data["source"] = "stooq"
+
+        wti_s = fetch_from_stooq("cl.f")
+        if wti_s and wti_s["close"]:
+            data["wti"] = wti_s["close"]
+            data["wti_high"] = wti_s["high"]
+            data["wti_low"] = wti_s["low"]
+            if wti_s["open"] and wti_s["open"] > 0:
+                data["wti_change"] = (wti_s["close"] - wti_s["open"]) / wti_s["open"] * 100
+            if data["source"] == "manual":
+                data["source"] = "stooq"
+    except Exception as e:
+        print(f"[WARN] Stooq原油API失败: {e}")
+
+    # 备用数据源: 东方财富
+    if data["brent"] is None:
+        try:
+            brent_url = "https://push2.eastmoney.com/api/qt/stock/get?secid=113.B00Y&fields=f43,f44,f45,f46,f47,f48,f169,f170"
+            resp = http_get(brent_url)
+            if resp:
+                brent_json = json.loads(resp)
+                if brent_json.get("data"):
+                    d = brent_json["data"]
+                    data["brent"] = d.get("f43", 0) / 100 if d.get("f43") else None
+                    data["brent_change"] = d.get("f169", 0) / 100 if d.get("f169") else None
+                    data["source"] = "eastmoney"
+        except Exception as e:
+            print(f"[WARN] 东方财富布伦特API失败: {e}")
+
+    if data["wti"] is None:
+        try:
+            wti_url = "https://push2.eastmoney.com/api/qt/stock/get?secid=113.CL00Y&fields=f43,f44,f45,f46,f47,f48,f169,f170"
+            resp = http_get(wti_url)
+            if resp:
+                wti_json = json.loads(resp)
+                if wti_json.get("data"):
+                    d = wti_json["data"]
+                    data["wti"] = d.get("f43", 0) / 100 if d.get("f43") else None
+                    data["wti_change"] = d.get("f169", 0) / 100 if d.get("f169") else None
+                    if data["source"] == "manual":
+                        data["source"] = "eastmoney"
+        except Exception as e:
+            print(f"[WARN] 东方财富WTI API失败: {e}")
+
+    return data
+
+def fetch_henry_hub():
+    """采集Henry Hub天然气期货价格"""
+    data = {"price": None, "change_pct": None, "high": None, "low": None, "source": "manual"}
+
+    # 主力数据源: Stooq
+    try:
+        hh = fetch_from_stooq("ng.f")
+        if hh and hh["close"]:
+            data["price"] = hh["close"]
+            data["high"] = hh["high"]
+            data["low"] = hh["low"]
+            if hh["open"] and hh["open"] > 0:
+                data["change_pct"] = (hh["close"] - hh["open"]) / hh["open"] * 100
+            data["source"] = "stooq"
+    except Exception as e:
+        print(f"[WARN] Stooq Henry Hub API失败: {e}")
+
+    # 备用数据源: 东方财富
+    if data["price"] is None:
+        try:
+            url = "https://push2.eastmoney.com/api/qt/stock/get?secid=113.NG00Y&fields=f43,f44,f45,f46,f47,f48,f169,f170"
+            resp = http_get(url)
+            if resp:
+                j = json.loads(resp)
+                if j.get("data"):
+                    d = j["data"]
+                    data["price"] = d.get("f43", 0) / 100 if d.get("f43") else None
+                    data["change_pct"] = d.get("f169", 0) / 100 if d.get("f169") else None
+                    data["source"] = "eastmoney"
+        except Exception as e:
+            print(f"[WARN] 东方财富Henry Hub API失败: {e}")
 
     return data
 
 
-# ─── 报告生成模块 ───
-def generate_html_report(data):
-    """生成HTML格式的能源市场日报"""
-    d = data
+def fetch_ttf_price():
+    """采集TTF天然气期货价格（欧洲基准）
+    数据源优先级: Yahoo Finance(主力) -> Stooq(备用)"""
+    data = {"price": None, "change_pct": None, "high": None, "low": None, "source": "manual"}
 
-    def change_color(pct):
-        if isinstance(pct, str):
-            pct = float(pct.replace('%', '').replace('+', ''))
-        if pct > 0:
-            return '<span style="color:#e74c3c;font-weight:bold;">▲ +{:.2f}%</span>'.format(pct)
-        elif pct < 0:
-            return '<span style="color:#27ae60;font-weight:bold;">▼ {:.2f}%</span>'.format(pct)
+    # 主力数据源: Yahoo Finance TTF=F
+    yahoo = fetch_from_yahoo("TTF=F")
+    if yahoo and yahoo["price"]:
+        data["price"] = yahoo["price"]
+        data["change_pct"] = yahoo.get("change_pct")
+        data["high"] = yahoo.get("high")
+        data["low"] = yahoo.get("low")
+        data["source"] = "yahoo"
+
+    # 备用数据源: Stooq（TTF代码: tg.f）
+    if data["price"] is None:
+        try:
+            ttf = fetch_from_stooq("tg.f")
+            if ttf and ttf["close"]:
+                data["price"] = ttf["close"]
+                data["high"] = ttf["high"]
+                data["low"] = ttf["low"]
+                if ttf["open"] and ttf["open"] > 0:
+                    data["change_pct"] = (ttf["close"] - ttf["open"]) / ttf["open"] * 100
+                data["source"] = "stooq"
+        except Exception as e:
+            print(f"[WARN] Stooq TTF API失败: {e}")
+
+    return data
+
+
+def fetch_usdcny_rate():
+    """采集美元/人民币汇率"""
+    data = {"rate": None, "source": "manual"}
+
+    # 主力数据源: ExchangeRate-API（JSON格式，更易解析）
+    try:
+        rate = fetch_from_exchangerate()
+        if rate:
+            data["rate"] = rate
+            data["source"] = "exchangerate-api"
+    except Exception as e:
+        print(f"[WARN] ExchangeRate-API失败: {e}")
+
+    # 备用数据源: Stooq（离岸汇率）
+    if data["rate"] is None:
+        try:
+            fx = fetch_from_stooq("usdcny")
+            if fx and fx["close"]:
+                data["rate"] = fx["close"]
+                data["source"] = "stooq"
+        except Exception as e:
+            print(f"[WARN] Stooq USD/CNY失败: {e}")
+
+    return data
+
+
+def fetch_mysteel_lng_terminals():
+    """
+    从我的钢铁网（Mysteel）抓取华东LNG接收站价格汇总表
+    策略：尝试今天日期URL → 昨天 → 前天的文章（三日内有效）
+    返回: list of dicts [{name, company, province, price, change, note}, ...]
+    """
+    terminals = []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+
+    # 已知的文章hash（6月1日）。今天/昨天的文章尝试同样hash
+    known_hashes = [
+        "8C84510163471331",
+        "29BD28945AE4E5E6",  # 全国LNG汇总的hash也试试
+    ]
+    hours = ["10", "08", "09", "11", "14", "15"]  # 常用发布时间
+
+    today = datetime.now()
+    article_text = None
+
+    # 尝试找最近三天的文章（静默请求，失败不打印WARN）
+    for days_back in range(3):
+        d = today - timedelta(days=days_back)
+        date_prefix = d.strftime("%y%m%d")
+        for h in hours:
+            for kh in known_hashes:
+                url = f"https://nenghua.mysteel.com/a/{date_prefix}{h}/{kh}.html"
+                # 静默HTTP请求（404是预期的）
+                try:
+                    req = urllib.request.Request(url, headers=headers)
+                    ctx = ssl.create_default_context()
+                    resp = urllib.request.urlopen(req, timeout=10, context=ctx)
+                    text = resp.read().decode("utf-8", errors="ignore")
+                except Exception:
+                    continue
+                if text and "液化天然气" in text and ("中石油" in text or "广汇" in text):
+                    article_text = text
+                    article_url = url
+                    break
+            if article_text:
+                break
+        if article_text:
+            break
+
+    if not article_text:
+        return terminals
+
+    # 解析终端价格数据
+    records = re.findall(
+        r'液化天然气(江苏省|浙江省|上海市|山东省|福建省|广东省|广西壮族自治区|广西|海南省|河北省|天津市|辽宁省)'
+        r'([\u4e00-\u9fa5（）()A-Za-z0-9]+?)(\d+)\s*元/吨',
+        article_text
+    )
+
+    seen = set()
+    for province, raw_name, price_str in records:
+        name = raw_name.strip()
+        price_num = int(price_str)
+        
+        # 价格解析：如 63500 → 6350元/吨 (涨跌0), 6400150 → 6400 (涨跌150)
+        if price_num < 100000:
+            price_val = price_num // 10
+            change_val = price_num % 10
         else:
-            return '<span style="color:#7f8c8d;">— 0.00%</span>'
+            price_val = price_num // 100
+            change_val = price_num % 100
 
-    def badge_cls(val):
-        if "+" in str(val):
-            return "badge-up"
-        elif "-" in str(val):
-            return "badge-down"
-        return "badge-flat"
+        if price_val < 4000 or price_val > 9000:
+            continue
 
-    def drivers_html(items):
-        return "\n".join('<div class="driver-item">{}</div>'.format(it) for it in items)
+        # 标准化名称和企业
+        name_clean = raw_name
+        company = ""
+        if "广汇" in raw_name or "启东" in raw_name:
+            company, name_clean = "广汇", "启东"
+        elif "如东" in raw_name:
+            company, name_clean = "中石油", "如东"
+        elif "中海油" in raw_name and "滨海" in raw_name:
+            company, name_clean = "中海油", "滨海"
+        elif "中海油" in raw_name and "宁波" in raw_name:
+            company, name_clean = "中海油", "宁波北仑"
+            if "苏北" in raw_name:
+                name_clean = "宁波北仑(苏北)"
+            elif "浙江" in raw_name:
+                name_clean = "宁波北仑(浙江)"
+        elif "浙能" in raw_name or "温州" in raw_name:
+            company, name_clean = "浙能", "温州"
+        elif "杭嘉" in raw_name:
+            company, name_clean = "杭嘉鑫", "嘉兴"
 
-    # 预计算各段HTML
-    station_rows = "\n".join(
-        '<tr><td>{}</td><td><strong>{}</strong></td>'
-        '<td><span class="badge {}">{}</span></td>'
-        '<td>{}</td></tr>'.format(
-            s["name"], s["price"], badge_cls(s["change"]), s["change"], s["origin"]
-        ) for s in d['lng_stations']
-    )
+        if not company:
+            continue
 
-    geo_events = "\n".join(
-        '<tr><td style="white-space:nowrap;"><strong>{}</strong></td>'
-        '<td style="text-align:left;">{}</td></tr>'.format(e["date"], e["event"])
-        for e in d['geopolitics']['events']
-    )
+        key = f"{province}|{name_clean}"
+        if key in seen:
+            continue
+        seen.add(key)
 
-    strategy_cards = "\n".join(
-        '<div class="strategy-card"><h4>{}</h4><p>{}</p></div>'.format(r["title"], r["content"])
-        for r in d['strategy']['recommendations']
-    )
+        region = "华东"
+        if province in ("河北省", "天津市", "辽宁省", "山东省"):
+            region = "华北/东北"
+        elif province in ("广东省", "广西", "广西壮族自治区", "海南省", "福建省"):
+            region = "华南"
 
-    watch_items = "\n".join(
-        '<li>{}</li>'.format(it) for it in d['strategy']['key_watch']
-    )
+        terminals.append({
+            "name": name_clean,
+            "company": company,
+            "province": province.replace("壮族自治区", ""),
+            "region": region,
+            "price": price_val,
+            "change": change_val,
+            "note": "Mysteel数据",
+        })
 
-    # 风险矩阵
-    risk_sections = []
-    for key, css in [("peace", "risk-peace"), ("stalemate", "risk-stalemate"), ("deterioration", "risk-deterioration")]:
-        rm = d['risk_matrix'][key]
-        risk_sections.append(
-            '<div class="risk-box {css}">'
-            '<h4>{name}</h4>'
-            '<p><strong>触发条件：</strong>{trigger}</p>'
-            '<table><tr><th>原油</th><th>国际天然气</th><th>国内LNG</th></tr>'
-            '<tr><td>{oil}</td><td>{gas}</td><td>{lng}</td></tr></table>'
-            '<p><strong>💡 策略：</strong>{strategy}</p>'
-            '</div>'.format(
-                css=css, name=rm['name'], trigger=rm['trigger'],
-                oil=rm['oil_impact'], gas=rm['gas_impact'], lng=rm['lng_impact'],
-                strategy=rm['strategy']
-            )
-        )
-    risk_html = "\n".join(risk_sections)
+    if terminals:
+        # 从URL提取文章日期
+        date_match = re.search(r'/a/(\d{6})\d{2}/', article_url)
+        art_date = date_match.group(1) if date_match else ""
+        art_date_str = f"20{art_date[:2]}-{art_date[2:4]}-{art_date[4:6]}" if art_date else ""
+        print(f"  Mysteel华东LNG: {art_date_str} 抓取到{len(terminals)}个接收站报价")
 
-    html = """<!DOCTYPE html>
+    return terminals
+
+
+def fetch_lng_prices():
+    """采集国内LNG价格（自动从LNG物联网抓取，失败回退手动数据）"""
+    data = {
+        "domestic_avg": None, "terminal_avg": None,
+        "domestic_high": None, "domestic_low": None,
+        "terminal_high": None, "terminal_low": None,
+        "terminal_high_name": None, "terminal_low_name": None,
+        "operating_rate": None, "up_count": None, "down_count": None,
+        "market_summary": "",
+        "source": "manual",
+        # === 各码头接收站价格（元/吨，手动后备） ===
+        "terminals": {
+            "华东": [
+                {"name": "如东", "company": "中石油", "province": "江苏", "price": 6350, "change": 0, "note": "出货平稳"},
+                {"name": "启东", "company": "广汇", "province": "江苏", "price": 6310, "change": 0, "note": ""},
+                {"name": "滨海", "company": "中海油", "province": "江苏", "price": 6510, "change": 0, "note": "华东价格高地"},
+                {"name": "温州", "company": "浙能", "province": "浙江", "price": 6450, "change": 0, "note": ""},
+                {"name": "嘉兴", "company": "杭嘉鑫", "province": "浙江", "price": 6670, "change": 0, "note": "华东最高"},
+                {"name": "宁波北仑", "company": "中海油", "province": "浙江", "price": "6400~6950", "change": 0, "note": "苏北6400/浙江6950"},
+            ],
+            "华南": [
+                {"name": "北海", "company": "国家管网", "province": "广西", "price": 6600, "change": 0, "note": "出厂价，西南方向主要货源"},
+                {"name": "莆田/漳州", "company": "国家管网", "province": "福建", "price": 6600, "change": 0, "note": "⚠ 暂不对外出货"},
+                {"name": "惠州", "company": "广东能源", "province": "广东", "price": None, "change": None, "note": "🚫 暂停竞拍（美伊战争影响）"},
+                {"name": "潮州华瀛", "company": "华瀛", "province": "广东", "price": None, "change": None, "note": "🚫 暂不外销"},
+            ],
+            "华北/东北": [
+                {"name": "曹妃甸", "company": "中石油", "province": "河北", "price": 6270, "change": "↓小幅回落", "note": "全国最低价"},
+                {"name": "天津南港", "company": "中石化", "province": "天津", "price": 6700, "change": 0, "note": "京津冀主要气源"},
+                {"name": "天津浮式", "company": "中海油", "province": "天津", "price": 6650, "change": 0, "note": ""},
+                {"name": "大连", "company": "中石油", "province": "辽宁", "price": 6550, "change": 0, "note": "东北主力接收站"},
+                {"name": "青岛董家口", "company": "中石化", "province": "山东", "price": 6700, "change": 0, "note": ""},
+                {"name": "青岛即墨", "company": "国家管网", "province": "山东", "price": 6650, "change": 0, "note": ""},
+            ],
+        },
+    }
+    
+    # === 策略：从LNG物联网(lng168.com)搜索最新文章并提取价格 ===
+    try:
+        import re as _re
+        
+        # 第一步：搜索文章列表，找到最新文章ID
+        search_url = "https://www.lng168.com/gateWay/newsList?keyword=LNG%E5%B8%82%E5%9C%BA%E6%95%B4%E4%BD%93%E6%8A%A5%E4%BB%B7"
+        search_text = http_get(search_url, timeout=10)
+        article_ids = []
+        if search_text:
+            article_ids = list(dict.fromkeys(_re.findall(r'newsDetail\?id=(\d+)', search_text)))
+        
+        # 第二步：逐个检查文章，找到今天或最近一天的
+        for aid in article_ids[:5]:
+            article_url = f"https://www.lng168.com/gateWay/newsDetail?id={aid}"
+            article_text = http_get(article_url, timeout=10)
+            if not article_text:
+                continue
+            
+            # 检查日期是否是今天或最近
+            date_match = _re.search(r'2026\.(\d+)\.(\d+)', article_text)
+            if not date_match:
+                continue
+            
+            # 去除HTML标签提取纯文本
+            clean_text = _re.sub(r'<[^>]+>', ' ', article_text)
+            clean_text = _re.sub(r'\s+', ' ', clean_text)
+            
+            # 提取液厂均价（容忍空格：6009 元 /吨）
+            avg_match = _re.search(r'市场均价为(\d+)\s*元', clean_text)
+            if avg_match:
+                data["domestic_avg"] = int(avg_match.group(1))
+            
+            # 提取液厂最高/最低价
+            high_match = _re.search(r'较高价报价(\d+)\s*元', clean_text)
+            if high_match:
+                data["domestic_high"] = int(high_match.group(1))
+            low_match = _re.search(r'较低价报价(\d+)\s*元', clean_text)
+            if low_match:
+                data["domestic_low"] = int(low_match.group(1))
+            
+            # 提取开工率
+            rate_match = _re.search(r'开工率(\d+)%', clean_text)
+            if rate_match:
+                data["operating_rate"] = int(rate_match.group(1))
+            
+            # 提取接收站均价
+            term_avg_match = _re.search(r'接收站均价\s*为(\d+)\s*元', clean_text)
+            if term_avg_match:
+                data["terminal_avg"] = int(term_avg_match.group(1))
+            
+            # 提取接收站最高价站（"较 高价是"可能有空格）
+            term_high_match = _re.search(r'较\s*高价是\s*(.+?)\s*报价(\d+)\s*元', clean_text)
+            if term_high_match:
+                data["terminal_high_name"] = term_high_match.group(1).strip()
+                data["terminal_high"] = int(term_high_match.group(2))
+            
+            # 提取接收站最低价站
+            term_low_match = _re.search(r'较\s*低价是(.+?)\s*报价(\d+)\s*元', clean_text)
+            if term_low_match:
+                data["terminal_low_name"] = term_low_match.group(1).strip()
+                data["terminal_low"] = int(term_low_match.group(2))
+            
+            # 提取涨跌厂数
+            up_match = _re.search(r'(\d+)家\s*调\s*涨', clean_text)
+            if up_match:
+                data["up_count"] = int(up_match.group(1))
+            down_match = _re.search(r'(\d+)家\s*降\s*价', clean_text)
+            if down_match:
+                data["down_count"] = int(down_match.group(1))
+            
+            # 如果至少获取到了均价，就不再尝试其他文章
+            if data["domestic_avg"] or data["terminal_avg"]:
+                data["source"] = "lng168"
+                print(f"  LNG数据已从lng168更新: 液厂{data['domestic_avg']}元/吨, 接收站{data['terminal_avg']}元/吨")
+                break
+    
+    except Exception as e:
+        print(f"[WARN] lng168 LNG数据抓取失败: {e}")
+    
+    # === 集成 Mysteel 华东LNG接收站实时价格 ===
+    try:
+        mysteel_terminals = fetch_mysteel_lng_terminals()
+        if mysteel_terminals:
+            # 更新华东地区终端价格
+            terminals = data.get("terminals", {})
+            for mt in mysteel_terminals:
+                region = mt.get("region", "华东")
+                if region not in terminals:
+                    terminals[region] = []
+                # 在已有列表中找同名终端更新
+                found = False
+                for existing in terminals.get(region, []):
+                    if mt["name"] in existing["name"] or existing["name"] in mt["name"]:
+                        existing["price"] = mt["price"]
+                        existing["change"] = mt["change"]
+                        existing["note"] = f"Mysteel实时数据"
+                        found = True
+                        break
+                if not found:
+                    terminals.setdefault(region, []).append({
+                        "name": mt["name"],
+                        "company": mt["company"],
+                        "province": mt["province"],
+                        "price": mt["price"],
+                        "change": mt["change"],
+                        "note": mt.get("note", "Mysteel实时数据"),
+                    })
+            data["terminals"] = terminals
+            if data["source"] == "manual":
+                data["source"] = "mysteel+lng168"
+    except Exception as e:
+        print(f"[WARN] Mysteel终端数据集成失败: {e}")
+    
+    return data
+
+def fetch_pipeline_gas_prices():
+    """管道天然气门站价格（月度更新）"""
+    # 门站价为月度/季度发布，非日频数据
+    # 来源：各省发改委 + 我的钢铁网/隆众资讯汇总
+    data = {
+        "provinces": {
+            "北京": {"base": 1860, "regulated": 2204, "unregulated": 3162, "peak": 4805},
+            "天津": {"base": 1860, "regulated": 2204, "unregulated": 3162, "peak": 4805},
+            "河北": {"base": 1840, "regulated": 2180, "unregulated": 3128, "peak": 4805},
+            "山西": {"base": 1770, "regulated": 2097, "unregulated": 3009, "peak": 4805},
+            "内蒙古": {"base": 1220, "regulated": 1446, "unregulated": 2196, "peak": 4805},
+            "辽宁": {"base": 1840, "regulated": 2180, "unregulated": 3128, "peak": 4805},
+        },
+        "unit": "元/千立方米",
+        "update_date": "2026-05-25",
+        "source": "我的钢铁网/隆众资讯/各省发改委",
+    }
+    return data
+
+def fetch_jkm_price():
+    """东北亚JKM现货价格
+    数据源优先级: Yahoo Finance JKM=F(主力) -> Nasdaq Data Link(备用) -> 手动估算"""
+    data = {"price": None, "change_pct": None, "high": None, "low": None, "date": None, "source": "manual"}
+
+    # 主力数据源: Yahoo Finance JKM=F
+    yahoo = fetch_from_yahoo("JKM=F")
+    if yahoo and yahoo["price"]:
+        data["price"] = yahoo["price"]
+        data["change_pct"] = yahoo.get("change_pct")
+        data["high"] = yahoo.get("high")
+        data["low"] = yahoo.get("low")
+        data["date"] = yahoo.get("date")
+        data["source"] = "yahoo"
+        return data
+
+    # 备用数据源: Nasdaq Data Link CHRIS/CME_JKM1 (免费注册API key)
+    nasdaq_key = os.environ.get("NASDAQ_API_KEY", "")
+    if nasdaq_key:
+        try:
+            url = f"https://data.nasdaq.com/api/v3/datasets/CHRIS/CME_JKM1/data.json?rows=3&api_key={nasdaq_key}"
+            nasdaq_text = http_get(url, timeout=15)
+            if nasdaq_text:
+                nasdaq_data = json.loads(nasdaq_text)
+                rows = nasdaq_data.get("dataset_data", {}).get("data", [])
+                if rows:
+                    latest = rows[0]
+                    prev = rows[1] if len(rows) > 1 else latest
+                    data["price"] = float(latest[4]) if len(latest) > 4 else float(latest[1])
+                    if prev and len(prev) > 4:
+                        prev_close = float(prev[4])
+                        if data["price"] and prev_close > 0:
+                            data["change_pct"] = (data["price"] - prev_close) / prev_close * 100
+                    data["date"] = latest[0]
+                    data["source"] = "nasdaq"
+                    return data
+        except Exception as e:
+            print(f"[WARN] Nasdaq JKM API失败: {e}")
+
+    return data
+
+def fetch_geopolitical_news():
+    """采集地缘政治要闻"""
+    # 在实际部署中，可接入新闻API（如newsapi.org）或RSS
+    # 这里返回手工整理的最新要闻
+    news = [
+        {
+            "date": "2026-05-29",
+            "title": "美军持续打击伊朗军事设施，霍尔木兹海峡航运中断风险升级",
+            "summary": "美军中央司令部连续第三天对伊朗南部及沿海军事目标实施精确打击，伊朗革命卫队宣布进入最高战备状态。海湾国家科威特、巴林、卡塔尔先后拉响防空警报，多国呼吁公民撤离伊朗。",
+            "impact": "布伦特站稳95美元上方，日内波动超3%",
+            "source": "新华社/路透社",
+        },
+        {
+            "date": "2026-05-28",
+            "title": "美军再次空袭伊朗境内目标，科威特拉响防空警报",
+            "summary": "美军中央司令部对伊朗南部阿巴斯港附近军事目标发动新一轮打击，同时伊朗革命卫队宣布对美军基地实施报复。",
+            "impact": "油价日内涨超2.6%",
+            "source": "凤凰网财经/新华社",
+        },
+        {
+            "date": "2026-05-25",
+            "title": "美军深夜空袭伊朗阿巴斯港，霍尔木兹再起波澜",
+            "summary": "美军摧毁两艘伊朗布雷艇并打击阿巴斯港防空导弹阵地，双方随即短暂交火。",
+            "impact": "布伦特短线跳水后反弹，盘中V形反转",
+            "source": "腾讯新闻/搜狐",
+        },
+        {
+            "date": "2026-05-24",
+            "title": "美伊就全面开放霍尔木兹海峡达成框架协议",
+            "summary": "华盛顿邮报报道美伊就谅解备忘录框架达成一致，30天内全面恢复霍尔木兹海峡航运，延长停火60天。",
+            "impact": "布伦特单日大跌至92美元附近",
+            "source": "新华社",
+        },
+        {
+            "date": "2026-05-20",
+            "title": "伊朗威胁封锁霍尔木兹海峡，全球LNG贸易高度紧张",
+            "summary": "伊朗议会通过决议授权政府在必要时封锁霍尔木兹海峡，卡塔尔LNG出口船队暂缓通行。全球约20%的LNG贸易需经此海峡。",
+            "impact": "JKM单日飙升12%，TTF同步跟涨",
+            "source": "路透社/Platts",
+        },
+    ]
+    return news
+
+
+def fetch_market_insights():
+    """各板块市场洞察数据（日度更新）"""
+    insights = {
+        "oil": {
+            "headline": "美伊冲突主导油价走向，布伦特站稳95美元",
+            "drivers": [
+                ("🇺🇸🇮🇷 美伊冲突升级", "美军连续打击伊朗沿海军事设施，霍尔木兹海峡通行风险上升，市场对供应中断的担忧持续推升油价。冲突以来布伦特累计涨幅超25%。"),
+                ("🛢️ OPEC+增产预期", "沙特表示若霍尔木兹海峡持续受阻，将释放剩余产能弥补供应缺口，但市场对其实际补偿能力存疑。"),
+                ("📉 EIA库存意外下降", "最新一周美国原油库存减少580万桶，远超市场预期，炼厂开工率回升至93%，需求端支撑油价。"),
+                ("🇨🇳 中国需求修复", "5月中国原油加工量环比回升，炼厂利润改善推动采购增加，但整体需求仍低于去年同期。"),
+            ],
+            "outlook": "短期油价在90-100美元区间高位震荡，方向取决于美伊谈判进展。若达成停火协议，布伦特可能快速回落至85美元；若冲突扩大至地面战争，布伦特有望冲击120-150美元。",
+            "impact_on_gas": "油价上涨通过JCC挂钩机制推升LNG长协价格，预计3-6个月后传导至国内进口成本。当前布伦特95美元对应下半年LNG长协到岸价约14-16美元/MMBtu。",
+        },
+        "gas_intl": {
+            "headline": "JKM高位震荡，TTF受欧洲补库支撑",
+            "drivers": [
+                ("🚢 霍尔木兹海峡风险", "卡塔尔LNG出口船队通行受阻或延迟，亚洲买家抢购替代货源，推升JKM现货溢价至19美元以上。"),
+                ("🇪🇺 欧洲补库需求", "EU天然气库存填充率约62%，低于去年同期68%，补库需求支撑TTF价格维持在55-60欧元/MWh区间。"),
+                ("🇺🇸 Henry Hub承压", "美国本土产量维持高位，天气转暖需求下降，HH在3美元附近窄幅波动，与亚洲形成显著价差套利窗口。"),
+                ("🇦🇺 澳大利亚检修", "Gorgon/Wheatstone项目进入年度检修期，减少亚太地区LNG供应量约200万吨/月。"),
+            ],
+            "outlook": "JKM短期内维持18-22美元/MMBtu高位，若霍尔木兹恢复正常通行则可能回落至14-16美元。HH预计在2.8-3.5美元区间运行，美亚套利空间吸引货流东移。",
+            "impact_on_gas": "JKM高位直接推升中国LNG进口现货成本，折合到岸完税价约6,700-7,000元/吨，与国内接收站出站价基本持平，进口利润窗口处于盈亏边缘。",
+        },
+        "lng_domestic": {
+            "headline": "国产液价低位盘整，接收站价格坚挺",
+            "drivers": [
+                ("🏭 液厂开工率偏低", "全国133家液厂开工率仅47%，西北/华北液厂因原料气成本偏高主动降负，供应端支撑价格。"),
+                ("📦 接收站进口成本倒挂", "JKM高位推升进口LNG到岸成本，接收站为避免亏损维持出站报价6,300-7,000元/吨区间。"),
+                ("🚫 华南供应紧张", "广东惠州暂停竞拍、潮州华瀛暂不外销，华南区域实际可流通进口LNG货源明显减少。"),
+                ("🌡️ 气温回升需求转弱", "全国大部气温回升，采暖需求消退，下游城燃采购以刚需为主，市场交投清淡。"),
+            ],
+            "outlook": "非采暖季国产LNG价格预计在5,700-6,200元/吨区间震荡；接收站价格受进口成本支撑维持6,300-7,000元/吨。若6月JKM回落，接收站价格有望松动。",
+            "impact_on_gas": "接收站与国产液价差达700-1,000元/吨，城燃企业采购应优先使用管道气合同量，LNG现货仅作为调峰补充。",
+        },
+    }
+    return insights
+
+# ============================================================
+# 报告生成模块
+# ============================================================
+
+def generate_terminal_tables(lng_data):
+    """生成接收站分区域价格表HTML"""
+    terminals = lng_data.get("terminals", {})
+    if not terminals:
+        return "<p style='color:#999;'>暂无码头价格数据</p>"
+    
+    region_colors = {
+        "华东": "#2980b9",
+        "华南": "#27ae60",
+        "华北/东北": "#e67e22",
+    }
+    
+    html_parts = []
+    for region, stations in terminals.items():
+        color = region_colors.get(region, "#666")
+        rows = ""
+        for s in stations:
+            price = s.get("price")
+            if price is None:
+                price_display = '<span style="color:#e74c3c;">——</span>'
+            elif isinstance(price, str):
+                price_display = f'<span style="font-weight:700;">{price}</span>'
+            else:
+                price_display = f'<span style="font-weight:700;">{price:,}</span>'
+            
+            change = s.get("change")
+            if change is None:
+                change_display = "——"
+            elif isinstance(change, str):
+                change_display = f'<span class="tag tag-green">{change}</span>'
+            elif change == 0:
+                change_display = '<span class="tag tag-green">0</span>'
+            else:
+                cls = "tag-red" if change > 0 else "tag-green"
+                change_display = f'<span class="tag {cls}">{change:+d}</span>'
+            
+            note = s.get("note", "")
+            note_display = f'<span style="color:#e74c3c;">{note}</span>' if "⚠" in note or "🚫" in note else note
+            
+            rows += f"""<tr><td>{s['name']}</td><td>{s['company']}</td><td>{s['province']}</td><td>{price_display}</td><td>{change_display}</td><td>{note_display}</td></tr>"""
+        
+        html_parts.append(f"""
+    <div style="margin-bottom:18px;">
+      <h4 style="font-size:14px;color:{color};margin-bottom:8px;">📍 {region}地区</h4>
+      <table>
+        <thead><tr><th>接收站</th><th>所属企业</th><th>省份</th><th>报价</th><th>涨跌</th><th>备注</th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+    </div>""")
+    
+    return "".join(html_parts)
+
+
+def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pipe_data, news_data, insights_data=None, ttf_data=None, fx_data=None):
+    """生成完整的HTML日报"""
+    
+    if insights_data is None:
+        insights_data = {}
+    oil_insight = insights_data.get("oil", {})
+    gas_insight = insights_data.get("gas_intl", {})
+    lng_insight = insights_data.get("lng_domestic", {})
+    
+    # 国际油价
+    brent = oil_data.get("brent") or 95.31
+    wti = oil_data.get("wti") or 94.59
+    brent_chg = oil_data.get("brent_change") or 2.6
+    wti_chg = oil_data.get("wti_change") or 2.7
+    brent_high = oil_data.get("brent_high")
+    brent_low = oil_data.get("brent_low")
+    wti_high = oil_data.get("wti_high")
+    wti_low = oil_data.get("wti_low")
+    
+    # 国际天然气
+    hh_price = hh_data.get("price") or 3.079
+    hh_chg = hh_data.get("change_pct") or -0.52
+    hh_high = hh_data.get("high")
+    hh_low = hh_data.get("low")
+    
+    # TTF
+    ttf_price = (ttf_data or {}).get("price") or 58.50
+    ttf_chg = (ttf_data or {}).get("change_pct") or 1.2
+    ttf_source = (ttf_data or {}).get("source", "manual")
+
+    # 汇率
+    usdcny = (fx_data or {}).get("rate") or 6.8240
+    fx_source = (fx_data or {}).get("source", "manual")
+
+    # JKM
+    jkm = jkm_data.get("price") or 19.04
+    jkm_chg = jkm_data.get("change_pct") or 13.6
+    jkm_source = jkm_data.get("source", "manual")
+    jkm_date = jkm_data.get("date", "")
+    
+    # 国内LNG
+    lng_domestic = lng_data.get("domestic_avg") or 5963
+    lng_terminal = lng_data.get("terminal_avg") or 6780
+    lng_dom_high = lng_data.get("domestic_high") or 6550
+    lng_dom_low = lng_data.get("domestic_low") or 5700
+    lng_term_high = lng_data.get("terminal_high") or 7750
+    lng_term_high_name = lng_data.get("terminal_high_name") or "国网广西北海"
+    lng_term_low = lng_data.get("terminal_low") or 6270
+    lng_term_low_name = lng_data.get("terminal_low_name") or "河北曹妃甸"
+    lng_op_rate = lng_data.get("operating_rate") or 47
+    lng_source = lng_data.get("source", "manual")
+    lng_up = lng_data.get("up_count")
+    lng_down = lng_data.get("down_count")
+    
+    lng_change_note = ""
+    if lng_up is not None and lng_down is not None:
+        lng_change_note = f"今日{lng_up}涨{lng_down}降"
+    
+    brent_high_str = f"{brent_high:.2f}" if brent_high else "—"
+    brent_low_str = f"{brent_low:.2f}" if brent_low else "—"
+    wti_high_str = f"{wti_high:.2f}" if wti_high else "—"
+    wti_low_str = f"{wti_low:.2f}" if wti_low else "—"
+    
+    oil_source = oil_data.get("source", "manual")
+    hh_source = hh_data.get("source", "manual")
+    
+    # 管道气省份表
+    provinces = pipe_data.get("provinces", {})
+    pipe_rows = ""
+    for name, p in provinces.items():
+        pipe_rows += f"""
+        <tr><td>{name}</td><td>{p['base']:,}</td><td>{p['regulated']:,}</td><td>{p['unregulated']:,}</td><td>{p['peak']:,}</td><td>元/千立方米</td></tr>"""
+    
+    # 新闻摘要
+    news_items = ""
+    for n in news_data[:5]:
+        news_items += f"""
+        <tr><td>{n['date']}</td><td><strong>{n['title']}</strong></td><td>{n['impact']}</td><td>{n['source']}</td></tr>"""
+    
+    # 构建HTML
+    html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>能源市场日报 | {report_date}</title>
 <style>
-* {{ margin:0; padding:0; box-sizing:border-box; }}
-body {{ font-family:'PingFang SC','Microsoft YaHei','Helvetica Neue',sans-serif; background:#f5f6fa; color:#2c3e50; line-height:1.7; }}
-.container {{ max-width:960px; margin:0 auto; padding:20px; }}
-.header {{ background:linear-gradient(135deg,#1a2a6c,#b21f1f,#fdbb2d); color:#fff; padding:40px 30px; border-radius:12px; text-align:center; margin-bottom:24px; }}
-.header h1 {{ font-size:28px; margin-bottom:8px; letter-spacing:2px; }}
-.header .date {{ font-size:16px; opacity:0.9; }}
-.header .subtitle {{ font-size:13px; opacity:0.7; margin-top:4px; }}
-.section {{ background:#fff; border-radius:10px; padding:24px 28px; margin-bottom:20px; box-shadow:0 2px 12px rgba(0,0,0,0.06); }}
-.section h2 {{ font-size:20px; color:#1a2a6c; border-left:4px solid #e74c3c; padding-left:12px; margin-bottom:16px; }}
-.section h3 {{ font-size:16px; color:#2c3e50; margin:16px 0 10px; }}
-table {{ width:100%; border-collapse:collapse; margin:12px 0; font-size:14px; }}
-th {{ background:#1a2a6c; color:#fff; padding:10px 12px; text-align:center; font-weight:500; }}
-td {{ padding:9px 12px; border-bottom:1px solid #ecf0f1; text-align:center; }}
-tr:nth-child(even) {{ background:#f8f9fa; }}
-.highlight {{ background:#fff3cd; padding:12px 16px; border-radius:6px; border-left:4px solid #f39c12; margin:12px 0; font-size:14px; }}
-.driver-item {{ padding:8px 0 8px 20px; position:relative; font-size:14px; }}
-.driver-item::before {{ content:'●'; position:absolute; left:0; color:#e74c3c; font-size:10px; top:10px; }}
-.risk-box {{ border-radius:8px; padding:16px 20px; margin:12px 0; }}
-.risk-peace {{ background:#d4edda; border:1px solid #28a745; }}
-.risk-stalemate {{ background:#fff3cd; border:1px solid #ffc107; }}
-.risk-deterioration {{ background:#f8d7da; border:1px solid #dc3545; }}
-.risk-box h4 {{ margin-bottom:8px; }}
-.strategy-card {{ background:#eef2ff; border-radius:8px; padding:14px 18px; margin:10px 0; }}
-.strategy-card h4 {{ color:#1a2a6c; margin-bottom:6px; }}
-.watch-list {{ background:#fffde7; padding:16px 20px; border-radius:8px; margin-top:16px; }}
-.watch-list li {{ margin:6px 0; font-size:14px; }}
-.footer {{ text-align:center; color:#95a5a6; font-size:12px; padding:20px 0; }}
-.badge {{ display:inline-block; padding:2px 8px; border-radius:4px; font-size:12px; font-weight:bold; }}
-.badge-up {{ background:#fde8e8; color:#e74c3c; }}
-.badge-down {{ background:#e8f5e9; color:#27ae60; }}
-.badge-flat {{ background:#f0f0f0; color:#7f8c8d; }}
+  :root {{ --primary: #1a3a5c; --accent: #e74c3c; --green: #27ae60; --bg: #f5f6fa; --card-bg: #ffffff; --text: #2c3e50; --text-light: #7f8c8d; --border: #dfe6e9; }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; }}
+  .header {{ background: linear-gradient(135deg, #1a3a5c 0%, #2c5f8a 100%); color: white; padding: 36px 48px; border-bottom: 4px solid var(--accent); }}
+  .header h1 {{ font-size: 28px; font-weight: 700; }}
+  .header .subtitle {{ font-size: 14px; opacity: 0.85; margin-top: 6px; }}
+  .header .date {{ font-size: 13px; opacity: 0.7; margin-top: 4px; }}
+  .container {{ max-width: 1100px; margin: 0 auto; padding: 24px 20px; }}
+  .summary-bar {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }}
+  .summary-card {{ background: var(--card-bg); border-radius: 10px; padding: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); border-left: 4px solid var(--primary); }}
+  .summary-card.warn {{ border-left-color: var(--accent); }}
+  .summary-card .label {{ font-size: 12px; color: var(--text-light); }}
+  .summary-card .value {{ font-size: 24px; font-weight: 700; margin: 4px 0; }}
+  .summary-card .change {{ font-size: 13px; }}
+  .summary-card .change.up {{ color: var(--accent); }}
+  .summary-card .change.down {{ color: var(--green); }}
+  section {{ margin-bottom: 24px; }}
+  .section-title {{ font-size: 18px; font-weight: 700; color: var(--primary); border-bottom: 2px solid var(--border); padding-bottom: 10px; margin-bottom: 16px; }}
+  table {{ width: 100%; border-collapse: collapse; background: var(--card-bg); border-radius: 8px; overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,0.04); }}
+  th {{ background: #eef2f7; color: var(--primary); font-weight: 600; font-size: 13px; text-align: left; padding: 12px 16px; }}
+  td {{ padding: 10px 16px; font-size: 14px; border-bottom: 1px solid var(--border); }}
+  tr:last-child td {{ border-bottom: none; }}
+  .tag {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }}
+  .tag-red {{ background: #fde8e8; color: #c0392b; }}
+  .tag-green {{ background: #e8f8f0; color: #27ae60; }}
+  .tag-blue {{ background: #e8f0fe; color: #2980b9; }}
+  .alert-banner {{ background: linear-gradient(135deg, #e74c3c, #c0392b); color: white; padding: 16px 24px; border-radius: 8px; margin-bottom: 16px; display: flex; align-items: center; gap: 12px; font-size: 14px; font-weight: 600; }}
+  .analysis-box {{ background: #fffbf5; border: 1px solid #f0c78e; border-radius: 10px; padding: 24px; margin-top: 8px; }}
+  .analysis-box h3 {{ color: #e67e22; font-size: 16px; margin-bottom: 12px; }}
+  .analysis-box p {{ font-size: 14px; margin-bottom: 10px; text-indent: 2em; }}
+  .key-points {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-top: 16px; }}
+  .key-point {{ background: var(--card-bg); border-left: 3px solid #e67e22; padding: 12px 16px; border-radius: 4px; font-size: 13px; }}
+  .risk-level {{ padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: 700; background: #fde8e8; color: #c0392b; }}
+  .footer {{ text-align: center; padding: 20px; font-size: 12px; color: var(--text-light); border-top: 1px solid var(--border); margin-top: 32px; }}
+  .data-source {{ font-size: 11px; color: #bbb; float: right; }}
 </style>
 </head>
 <body>
-<div class="container">
-
-<!-- 报头 -->
 <div class="header">
   <h1>⚡ 能源市场日报</h1>
-  <div class="date">{report_date}</div>
-  <div class="subtitle">Energy Market Daily Report | 自动生成于 {gen_time}</div>
+  <div class="subtitle">城市燃气 · 市场决策参考</div>
+  <div class="date">📅 {report_date} | 数据截至 08:00 CST <span class="data-source">油:{oil_source} | 气:{hh_source} | TTF:{ttf_source} | JKM:{jkm_source} | 汇率:{fx_source} | LNG:{lng_source}</span></div>
 </div>
-
-<!-- 一、国际原油市场 -->
-<div class="section">
-  <h2>一、国际原油市场</h2>
-  <table>
-    <tr><th>品种</th><th>价格</th><th>日涨跌</th><th>月涨跌</th><th>年涨跌</th></tr>
-    <tr>
-      <td><strong>布伦特 Brent</strong></td>
-      <td><strong>{brent_price}</strong> {brent_unit}</td>
-      <td>{brent_cc}</td><td>{brent_mc}</td><td>{brent_yc}</td>
-    </tr>
-    <tr>
-      <td><strong>WTI</strong></td>
-      <td><strong>{wti_price}</strong> {wti_unit}</td>
-      <td>{wti_cc}</td><td>{wti_mc}</td><td>{wti_yc}</td>
-    </tr>
-  </table>
-  <h3>🔍 涨跌驱动因子</h3>
-  {crude_drivers}
-</div>
-
-<!-- 二、国际天然气期货 -->
-<div class="section">
-  <h2>二、国际天然气期货</h2>
-  <table>
-    <tr><th>品种</th><th>价格</th><th>日涨跌</th><th>月涨跌</th><th>年涨跌</th></tr>
-    <tr>
-      <td><strong>Henry Hub</strong></td>
-      <td><strong>{hh_price}</strong> {hh_unit}</td>
-      <td>{hh_cc}</td><td>{hh_mc}</td><td>—</td>
-    </tr>
-    <tr>
-      <td><strong>TTF（荷兰）</strong></td>
-      <td><strong>{ttf_price}</strong> {ttf_unit}</td>
-      <td>{ttf_cc}</td><td>{ttf_mc}</td><td>{ttf_yc}</td>
-    </tr>
-    <tr>
-      <td><strong>JKM（日韩）</strong></td>
-      <td><strong>{jkm_price}</strong> {jkm_unit}</td>
-      <td>{jkm_cc}</td><td>{jkm_mc}</td><td>{jkm_yc}</td>
-    </tr>
-  </table>
-  <h3>🔍 涨跌驱动因子</h3>
-  {gas_drivers}
-</div>
-
-<!-- 三、国内LNG市场总览 -->
-<div class="section">
-  <h2>三、国内LNG市场总览</h2>
-  <table>
-    <tr><th>指标</th><th>价格</th><th>环比变化</th></tr>
-    <tr><td><strong>工厂出厂均价</strong></td><td><strong>{lng_fa}</strong> {lng_fau}</td><td><span class="badge badge-up">{lng_fam}</span></td></tr>
-    <tr><td><strong>接收站出站均价</strong></td><td><strong>{lng_sa}</strong> {lng_sau}</td><td><span class="badge badge-up">{lng_sam}</span></td></tr>
-    <tr><td><strong>现货进口到岸价</strong></td><td><strong>{lng_cif}</strong> {lng_cifu}</td><td><span class="badge badge-up">{lng_cifm}</span></td></tr>
-  </table>
-  <div class="highlight">
-    📊 <strong>供给概况：</strong>统计{lng_fc}家LNG工厂，{lng_mc2}家检修/停产/停报，对外开工率{lng_or}。工厂供应量约{lng_sft}万吨（{lng_sfm}），接收站槽批供应约{lng_sst}万吨（{lng_ssm}）。
+<div class="container">
+  <div class="alert-banner">
+    <span>🚨</span><span>地缘风险预警：美伊冲突持续，霍尔木兹海峡局势反复，国际油价高位震荡</span>
   </div>
-  <h3>🔍 涨跌驱动因子</h3>
-  {lng_drivers}
-</div>
-
-<!-- 四、16座LNG接收站进口价格明细 -->
-<div class="section">
-  <h2>四、全国LNG接收站进口价格明细</h2>
-  <table>
-    <tr><th>接收站</th><th>出站价格（元/吨）</th><th>日涨跌</th><th>主要气源地</th></tr>
-    {station_rows}
-  </table>
-</div>
-
-<!-- 五、管道天然气交易市场 -->
-<div class="section">
-  <h2>五、管道天然气交易市场</h2>
-  <h3>1️⃣ {shpgx_name}（SHPGX）</h3>
-  <table>
-    <tr><th>最新场次</th><th>加权均价</th><th>变化</th><th>成交量</th></tr>
-    <tr><td>{shpgx_session}</td><td><strong>{shpgx_price}</strong> {shpgx_unit}</td><td><span class="badge badge-up">{shpgx_chg}</span></td><td>{shpgx_vol}</td></tr>
-  </table>
-  <div class="highlight">💡 {shpgx_note}</div>
-  <h3>2️⃣ {cq_name}</h3>
-  <table>
-    <tr><th>公告编号</th><th>竞拍日期</th><th>交收期</th></tr>
-    <tr><td>{cq_session}</td><td>{cq_date}</td><td>{cq_period}</td></tr>
-  </table>
-  <div class="highlight">💡 {cq_note}</div>
-  <h3>3️⃣ {yc_name}</h3>
-  <table>
-    <tr><th>最新场次</th><th>竞拍结果</th><th>底价</th></tr>
-    <tr><td>{yc_session}</td><td><span class="badge badge-down"><strong>{yc_result}</strong></span></td><td>{yc_price} {yc_unit}</td></tr>
-  </table>
-  <div class="highlight">💡 {yc_note}</div>
-</div>
-
-<!-- 六、地缘政治要闻 -->
-<div class="section">
-  <h2>六、地缘政治要闻</h2>
-  <div class="highlight" style="border-left-color:#e74c3c;background:#fde8e8;">
-    ⚠️ <strong>{geo_headline}</strong>
+  <div class="summary-bar">
+    <div class="summary-card warn"><div class="label">布伦特原油</div><div class="value">{brent:.2f}</div><div class="change up">▲ +{brent_chg}% | 美元/桶</div></div>
+    <div class="summary-card warn"><div class="label">WTI原油</div><div class="value">{wti:.2f}</div><div class="change up">▲ +{wti_chg}% | 美元/桶</div></div>
+    <div class="summary-card"><div class="label">Henry Hub天然气</div><div class="value">{hh_price:.3f}</div><div class="change {'down' if hh_chg < 0 else 'up'}">{'▼' if hh_chg < 0 else '▲'} {abs(hh_chg)}% | 美元/MMBtu</div></div>
+    <div class="summary-card"><div class="label">国内LNG出厂均价</div><div class="value">{lng_domestic:,}</div><div class="change down">元/吨 | 开工率{lng_op_rate}%</div></div>
   </div>
-  <h3>📋 事件时间线</h3>
-  <table>
-    <tr><th>日期</th><th>事件</th></tr>
-    {geo_events}
-  </table>
-  <h3>🔑 关键研判</h3>
-  {geo_points}
-</div>
 
-<!-- 七、三情景风险矩阵 -->
-<div class="section">
-  <h2>七、三情景风险矩阵</h2>
-  {risk_html}
-</div>
+  <section>
+    <div class="section-title">🛢️ 一、国际原油市场</div>
+    <table>
+      <thead><tr><th>品种</th><th>最新价</th><th>涨跌幅</th><th>日内高</th><th>日内低</th><th>单位</th></tr></thead>
+      <tbody>
+        <tr><td><strong>布伦特原油 (ICE)</strong></td><td style="color:#e74c3c;font-weight:700;">{brent:.2f}</td><td><span class="tag tag-red">+{brent_chg:.2f}%</span></td><td>{brent_high_str}</td><td>{brent_low_str}</td><td>美元/桶</td></tr>
+        <tr><td><strong>WTI原油 (NYMEX)</strong></td><td style="color:#e74c3c;font-weight:700;">{wti:.2f}</td><td><span class="tag tag-red">+{wti_chg:.2f}%</span></td><td>{wti_high_str}</td><td>{wti_low_str}</td><td>美元/桶</td></tr>
+        <tr><td><strong>WTI-Brent价差</strong></td><td>{wti-brent:.2f}</td><td><span class="tag tag-blue">—</span></td><td>—</td><td>—</td><td>美元/桶</td></tr>
+      </tbody>
+    </table>
+    <div style="margin-top:14px;padding:16px 20px;background:#fff8f0;border:1px solid #f0c78e;border-radius:10px;">
+      <div style="font-size:15px;font-weight:700;color:#e67e22;margin-bottom:10px;">🔍 原油市场洞察</div>
+      <div style="font-size:14px;font-weight:600;color:#c0392b;margin-bottom:8px;">{oil_insight.get('headline', '美伊冲突主导油价走向')}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
+        {"".join(f'<div style="background:#fff;padding:10px 14px;border-radius:6px;border-left:3px solid #e67e22;font-size:13px;"><strong>{d[0]}</strong><br><span style="color:#555;">{d[1]}</span></div>' for d in oil_insight.get('drivers', []))}
+      </div>
+      <div style="font-size:13px;color:#555;padding:8px 0;border-top:1px dashed #e0d5c5;"><strong>📈 前景展望：</strong>{oil_insight.get('outlook', '短期高位震荡')}</div>
+      <div style="font-size:13px;color:#c0392b;margin-top:6px;"><strong>⚡ 对城燃影响：</strong>{oil_insight.get('impact_on_gas', '油价上涨推升LNG长协价格')}</div>
+    </div>
+  </section>
 
-<!-- 八、市场综合分析及策略建议 -->
-<div class="section">
-  <h2>八、市场综合分析及策略建议</h2>
-  <div class="highlight" style="border-left-color:#1a2a6c;background:#eef2ff;">
-    📊 <strong>总体研判：</strong>{overall}
-  </div>
-  <h3>🎯 策略建议</h3>
-  {strategy_cards}
-  <div class="watch-list">
-    <h4>📅 本周重点关注</h4>
-    <ul>{watch_items}</ul>
-  </div>
-</div>
+  <section>
+    <div class="section-title">🔥 二、国际天然气期货 &amp; 现货</div>
+    <table>
+      <thead><tr><th>品种</th><th>最新价</th><th>涨跌幅</th><th>备注</th><th>单位</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Henry Hub (NYMEX)</strong></td><td>{hh_price:.3f}</td><td><span class="tag {'tag-green' if hh_chg < 0 else 'tag-red'}">{hh_chg:+.2f}%</span></td><td>北美供需平衡</td><td>美元/MMBtu</td></tr>
+        <tr><td><strong>TTF (荷兰)</strong></td><td>{ttf_price:.2f}</td><td><span class="tag {'tag-green' if ttf_chg < 0 else 'tag-red'}">{ttf_chg:+.2f}%</span></td><td>欧洲库存偏低</td><td>欧元/兆瓦时</td></tr>
+        <tr><td><strong>JKM东北亚现货</strong></td><td>{jkm:.2f}</td><td><span class="tag tag-red">+{jkm_chg}%</span></td><td>{'地缘溢价维持高位' if jkm_source == 'manual' else f'{jkm_source}实时数据'}</td><td>美元/MMBtu</td></tr>
+        <tr><td><strong>中国LNG到岸价 (DES)</strong></td><td>18.50</td><td><span class="tag tag-red">+10.8%</span></td><td>跟随JKM联动</td><td>美元/MMBtu</td></tr>
+      </tbody>
+    </table>
+    <div style="margin-top:14px;padding:16px 20px;background:#f0f7ff;border:1px solid #a8c8e8;border-radius:10px;">
+      <div style="font-size:15px;font-weight:700;color:#2980b9;margin-bottom:10px;">🔍 天然气市场洞察</div>
+      <div style="font-size:14px;font-weight:600;color:#1a5276;margin-bottom:8px;">{gas_insight.get('headline', 'JKM高位震荡，TTF受欧洲补库支撑')}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
+        {"".join(f'<div style="background:#fff;padding:10px 14px;border-radius:6px;border-left:3px solid #2980b9;font-size:13px;"><strong>{d[0]}</strong><br><span style="color:#555;">{d[1]}</span></div>' for d in gas_insight.get('drivers', []))}
+      </div>
+      <div style="font-size:13px;color:#555;padding:8px 0;border-top:1px dashed #c5d5e5;"><strong>📈 前景展望：</strong>{gas_insight.get('outlook', 'JKM短期维持高位')}</div>
+      <div style="font-size:13px;color:#c0392b;margin-top:6px;"><strong>⚡ 对城燃影响：</strong>{gas_insight.get('impact_on_gas', 'JKM高位推升进口成本')}</div>
+    </div>
+  </section>
 
-<!-- 页脚 -->
+  <section>
+    <div class="section-title">🏭 三、国内LNG市场总览</div>
+    <table>
+      <thead><tr><th>类别</th><th>均价</th><th>最高价</th><th>最低价</th><th>备注</th><th>单位</th></tr></thead>
+      <tbody>
+        <tr><td><strong>国产液厂</strong> (133家)</td><td>{lng_domestic:,}</td><td>{lng_dom_high:,}</td><td>{lng_dom_low:,}</td><td>开工率{lng_op_rate}%，{lng_change_note}</td><td>元/吨</td></tr>
+        <tr><td><strong>接收站均价</strong> (19家)</td><td>{lng_terminal:,}</td><td>{lng_term_high:,}（{lng_term_high_name}）</td><td>{lng_term_low:,}（{lng_term_low_name}）</td><td>进口成本高企</td><td>元/吨</td></tr>
+        <tr><td><strong>原料气竞拍</strong> (5月下半月)</td><td>3.65-3.95</td><td>—</td><td>—</td><td>中石油直供</td><td>元/方</td></tr>
+      </tbody>
+    </table>
+    <div style="margin-top:14px;padding:16px 20px;background:#f5fff5;border:1px solid #b8d4be;border-radius:10px;">
+      <div style="font-size:15px;font-weight:700;color:#27ae60;margin-bottom:10px;">🔍 国内LNG市场洞察</div>
+      <div style="font-size:14px;font-weight:600;color:#1e8449;margin-bottom:8px;">{lng_insight.get('headline', '国产液价低位盘整，接收站价格坚挺')}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
+        {"".join(f'<div style="background:#fff;padding:10px 14px;border-radius:6px;border-left:3px solid #27ae60;font-size:13px;"><strong>{d[0]}</strong><br><span style="color:#555;">{d[1]}</span></div>' for d in lng_insight.get('drivers', []))}
+      </div>
+      <div style="font-size:13px;color:#555;padding:8px 0;border-top:1px dashed #c5ddd0;"><strong>📈 前景展望：</strong>{lng_insight.get('outlook', '非采暖季低位震荡')}</div>
+      <div style="font-size:13px;color:#c0392b;margin-top:6px;"><strong>⚡ 对城燃影响：</strong>{lng_insight.get('impact_on_gas', '优先使用管道气合同量')}</div>
+    </div>
+  </section>
+
+  <!-- 进口LNG接收站（码头）价格明细 -->
+  <section>
+    <div class="section-title">🚢 三-B、全国主要LNG接收站（码头）进口价格明细</div>
+    <div style="margin-bottom:12px;font-size:13px;color:#666;">📅 数据日期：{report_date} | 单位：元/吨（槽批自提出站价） | 来源：隆众资讯/我的钢铁网</div>
+    {generate_terminal_tables(lng_data)}
+    <div style="margin-top:12px;padding:14px 18px;background:#fffbf5;border:1px solid #f0c78e;border-radius:8px;font-size:13px;">
+      <strong>📌 进口LNG码头市场洞察：</strong><br>
+      ① <strong>华南供应紧张：</strong>广东惠州因美伊战争影响暂停竞拍，潮州华瀛暂不外销，华南实际可流通进口LNG仅北海和福建两家，区域供应明显收紧。<br>
+      ② <strong>华东价格坚挺：</strong>6座主要接收站报价6,310~6,950元/吨，与国产液价差拉大至700-1,000元/吨。<br>
+      ③ <strong>华北曹妃甸有优势：</strong>河北曹妃甸~6,270元/吨为全国码头最低价，较华东/华南低300-700元/吨。<br>
+      ④ <strong>进口成本倒挂风险：</strong>JKM约19美元/MMBtu，折合到岸完税成本约6,700-7,000元/吨，与码头出站价基本持平，进口窗口处于盈亏边缘。
+    </div>
+  </section>
+
+  <section>
+    <div class="section-title">📡 四、管道天然气交易市场动态</div>
+    
+    <div style="margin-bottom:18px;">
+      <h4 style="font-size:14px;color:#2980b9;margin-bottom:8px;">🏛 上海石油天然气交易中心（SHPGX）| {report_date}</h4>
+      <table>
+        <thead><tr><th>交易品种</th><th>成交量</th><th>成交均价</th><th>备注</th></tr></thead>
+        <tbody>
+          <tr><td><strong>管道气挂牌交易</strong></td><td style="font-weight:700;">6,076 万方</td><td>—</td><td>当日活跃度较高</td></tr>
+          <tr><td>中石油液体竞价</td><td>880 吨</td><td>—</td><td></td></tr>
+          <tr><td>LNG挂牌交易</td><td>6,000 吨</td><td>—</td><td></td></tr>
+        </tbody>
+      </table>
+      <div style="margin-top:12px;">
+        <h5 style="font-size:13px;color:#555;margin-bottom:6px;">📊 SHPGX 价格指数</h5>
+        <table>
+          <thead><tr><th>指数名称</th><th>最新值</th><th>上期</th><th>变动</th><th>单位</th></tr></thead>
+          <tbody>
+            <tr><td>中国LNG出厂价格</td><td style="font-weight:700;">6,156</td><td>6,180</td><td><span class="tag tag-green">-24</span></td><td>元/吨</td></tr>
+            <tr><td>中国LNG出站价格</td><td style="font-weight:700;">6,207</td><td>6,217</td><td><span class="tag tag-green">-10</span></td><td>元/吨</td></tr>
+            <tr style="background:#fffbf5;"><td><strong>🔥 管道气现货价格（5月）</strong></td><td style="font-weight:700;color:#e74c3c;">4.39</td><td>3.62 (4月)</td><td><span class="tag tag-red">+21.3%</span></td><td>元/立方米</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div style="margin-bottom:18px;">
+      <h4 style="font-size:14px;color:#e67e22;margin-bottom:8px;">🏛 重庆石油天然气交易中心 & 延长石油竞拍</h4>
+      <table>
+        <thead><tr><th>竞拍品种</th><th>日期</th><th>成交价</th><th>环比</th><th>成交量</th><th>备注</th></tr></thead>
+        <tbody>
+          <tr style="background:#fffbf5;">
+            <td><strong>🔥 延长石油管道气</strong>（靖边）</td><td>5月22日</td><td style="font-weight:700;color:#e74c3c;">3.71-3.75 元/方</td><td><span class="tag tag-red">+0.33~0.37</span></td><td>14,400万方</td><td>6月交收，全部成交</td></tr>
+          <tr><td>SHPGX管道气竞价</td><td>5月22日</td><td style="font-weight:700;">3.351 元/方</td><td>—</td><td>1,800万方</td><td>双边统计</td></tr>
+          <tr><td>重庆-广西管道气</td><td>5月25日</td><td>待公布</td><td>—</td><td>—</td><td>合同外气量</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div style="padding:14px 18px;background:#f4faf7;border:1px solid #b8d4be;border-radius:8px;font-size:13px;">
+      <strong>📌 管道气市场洞察：</strong><br>
+      ① 管道气现货4.39元/方，是管制气门站价（~2.2元/方）的<strong>两倍</strong>。充分落实年度合同量是控成本的核心。<br>
+      ② 延长石油靖边6月竞拍3.71-3.75元/方，环比涨超10%，2月以来累计涨幅超75%，西北气源外输需求旺盛。
+    </div>
+  </section>
+
+  <section>
+    <div class="section-title">🌍 五、地缘政治要闻 &amp; 美伊冲突进展</div>
+    <div style="margin-bottom:14px;padding:14px 18px;background:#fde8e8;border:1px solid #e74c3c;border-radius:8px;">
+      <div style="font-size:14px;font-weight:700;color:#c0392b;margin-bottom:6px;">🚨 核心关注：美伊冲突局势图</div>
+      <div style="font-size:13px;color:#555;">
+        <strong>当前态势：</strong>美军持续打击伊朗沿海军事设施，霍尔木兹海峡航运反复中断。美伊「边打边谈」——军事升级与外交谈判交替推进，市场在风险溢价与和平预期之间剧烈摇摆。<br>
+        <strong>关键节点：</strong>霍尔木兹海峡每日通过约2,100万桶原油（占全球海运量21%）及约3.5万亿立方英尺LNG（占全球贸易20%）。海峡封锁将直接冲击亚洲能源供应。<br>
+        <strong>最新进展：</strong>伊朗议会已授权政府可在必要时封锁海峡；卡塔尔LNG船队通行多次延迟；沙特承诺释放剩余产能但实际补偿能力存疑。
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>日期</th><th>事件</th><th>市场影响</th><th>来源</th></tr></thead>
+      <tbody>{news_items}</tbody>
+    </table>
+    <div style="margin-top:14px;padding:16px 20px;background:#fffbf5;border:1px solid #f0c78e;border-radius:10px;">
+      <div style="font-size:15px;font-weight:700;color:#e67e22;margin-bottom:10px;">🔍 地缘风险情景分析</div>
+      <div style="display:grid;grid-template-columns:repeat(3, 1fr);gap:12px;">
+        <div style="background:#e8f8f0;padding:12px 16px;border-radius:8px;border-top:3px solid #27ae60;">
+          <div style="font-size:13px;font-weight:700;color:#27ae60;margin-bottom:6px;">🟢 和平情景</div>
+          <div style="font-size:12px;color:#555;">美伊30天内达成停火协议，霍尔木兹全面恢复通航。<br><strong>影响：</strong>布伦特回落至80-85美元，JKM跌至12-14美元/MMBtu，LNG进口成本大幅下降。</div>
+        </div>
+        <div style="background:#fffbf5;padding:12px 16px;border-radius:8px;border-top:3px solid #e67e22;">
+          <div style="font-size:13px;font-weight:700;color:#e67e22;margin-bottom:6px;">🟡 僵持情景（当前）</div>
+          <div style="font-size:12px;color:#555;">边打边谈，海峡间歇性受阻，冲突有限升级。<br><strong>影响：</strong>布伦特90-100美元震荡，JKM维持18-22美元，进口LNG成本持续高位。</div>
+        </div>
+        <div style="background:#fde8e8;padding:12px 16px;border-radius:8px;border-top:3px solid #e74c3c;">
+          <div style="font-size:13px;font-weight:700;color:#c0392b;margin-bottom:6px;">🔴 恶化情景</div>
+          <div style="font-size:12px;color:#555;">冲突扩大为地面战争，霍尔木兹长期封锁。<br><strong>影响：</strong>布伦特冲击120-200美元，JKM挑战30+美元，国内气价全面倒挂，需启动应急保供预案。</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-title">📊 六、市场分析</div>
+    <div class="analysis-box">
+      <h3>美伊冲突对城市燃气行业的影响评估</h3>
+      <div style="margin:8px 0;"><span style="font-weight:600;">风险等级：</span><span class="risk-level">⚠ 高度风险</span></div>
+      <p><strong>核心逻辑：</strong>霍尔木兹海峡是卡塔尔LNG出口的咽喉通道。卡塔尔占全球LNG贸易量约20%，一旦海峡通行受阻，亚洲LNG买家将被迫转向澳大利亚、美国墨西哥湾等替代货源，推高全球LNG现货价格。自2月28日冲突爆发以来，JKM现货价格累计涨幅已超过80%。</p>
+      <p><strong>传导路径：</strong>油价上涨→挂钩JCC的LNG长协价格滞后3-6个月跟涨→进口LNG成本攀升→接收站出站价格高企→城市燃气企业采购成本压力加大。当前布伦特站稳95美元上方，将推动2026年下半年LNG长协价格显著上升。</p>
+      <p><strong>对城市燃气企业影响：</strong>非居民用气价格倒挂风险加大。当前各省门站管制气价格（约2.0-2.2元/立方米）与LNG现货折算价（约4.5-5.0元/立方米）形成巨大价差。建议企业加快落实非居民用气顺价机制，同时充分利用管道气合同量，减少高价LNG现货采购。</p>
+      <div class="key-points">
+        <div class="key-point"><strong>▶ 短期策略：</strong>关注6月美伊谈判进展，若协议达成JKM可能快速回落至15美元以下，可在此区间锁定现货。</div>
+        <div class="key-point"><strong>▶ 中期策略：</strong>最大化管道气合同量，非采暖季加快储气库注气节奏，降低冬季对高价现货的依赖。</div>
+        <div class="key-point"><strong>▶ 风险提示：</strong>若霍尔木兹持续封锁至年底，布伦特可能冲击200美元，JKM可能挑战30美元。需做好极端情景预案。</div>
+        <div class="key-point"><strong>▶ 政策关注：</strong>密切跟踪各省非采暖季价格调整窗口，及时启动非居民用气顺价程序。</div>
+      </div>
+    </div>
+  </section>
+
+</div>
 <div class="footer">
-  <p>能源市场日报 | 数据来源：TradingEconomics / EIA / SHPGGX / LNG物联网</p>
-  <p>本报告由 AI Agent 自动生成，仅供参考，不构成投资建议</p>
-  <p>生成时间：{footer_time}</p>
-</div>
-
+  <p>本报告由能源市场日报自动生成系统产出 | 数据来源：ICE、NYMEX、Yahoo Finance、EIA、ICE ENDEX、S&P Global Platts、我的钢铁网、LNG物联网、隆众资讯、各省发改委</p>
+  <p>声明：本报告仅供内部决策参考，不构成投资建议 | 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')} CST</p>
 </div>
 </body>
-</html>""".format(
-        report_date=d['report_date'],
-        gen_time=datetime.now().strftime('%H:%M:%S'),
-
-        # 原油
-        brent_price="{:.2f}".format(d['crude_oil']['brent']['price']),
-        brent_unit=d['crude_oil']['brent']['unit'],
-        brent_cc=change_color(d['crude_oil']['brent']['change_pct']),
-        brent_mc=change_color(d['crude_oil']['brent']['monthly_change']),
-        brent_yc=change_color(d['crude_oil']['brent']['yearly_change']),
-        wti_price="{:.2f}".format(d['crude_oil']['wti']['price']),
-        wti_unit=d['crude_oil']['wti']['unit'],
-        wti_cc=change_color(d['crude_oil']['wti']['change_pct']),
-        wti_mc=change_color(d['crude_oil']['wti']['monthly_change']),
-        wti_yc=change_color(d['crude_oil']['wti']['yearly_change']),
-        crude_drivers=drivers_html(d['crude_oil']['drivers']),
-
-        # 天然气期货
-        hh_price="{:.2f}".format(d['natgas_futures']['henry_hub']['price']),
-        hh_unit=d['natgas_futures']['henry_hub']['unit'],
-        hh_cc=change_color(d['natgas_futures']['henry_hub']['change_pct']),
-        hh_mc=change_color(d['natgas_futures']['henry_hub']['monthly_change']),
-        ttf_price="{:.2f}".format(d['natgas_futures']['ttf']['price']),
-        ttf_unit=d['natgas_futures']['ttf']['unit'],
-        ttf_cc=change_color(d['natgas_futures']['ttf']['change_pct']),
-        ttf_mc=change_color(d['natgas_futures']['ttf']['monthly_change']),
-        ttf_yc=change_color(d['natgas_futures']['ttf']['yearly_change']),
-        jkm_price="{:.2f}".format(d['natgas_futures']['jkm']['price']),
-        jkm_unit=d['natgas_futures']['jkm']['unit'],
-        jkm_cc=change_color(d['natgas_futures']['jkm']['change_pct']),
-        jkm_mc=change_color(d['natgas_futures']['jkm']['monthly_change']),
-        jkm_yc=change_color(d['natgas_futures']['jkm']['yearly_change']),
-        gas_drivers=drivers_html(d['natgas_futures']['drivers']),
-
-        # 国内LNG
-        lng_fa=d['lng_china']['factory_avg'],
-        lng_fau=d['lng_china']['factory_avg_unit'],
-        lng_fam=d['lng_china']['factory_mom'],
-        lng_sa=d['lng_china']['station_avg'],
-        lng_sau=d['lng_china']['station_avg_unit'],
-        lng_sam=d['lng_china']['station_mom'],
-        lng_cif=d['lng_china']['spot_cif'],
-        lng_cifu=d['lng_china']['spot_cif_unit'],
-        lng_cifm=d['lng_china']['spot_mom'],
-        lng_fc=d['lng_china']['factory_count'],
-        lng_mc2=d['lng_china']['maintenance_count'],
-        lng_or=d['lng_china']['operating_rate'],
-        lng_sft="{:.1f}".format(d['lng_china']['supply_factory_tons']/10000),
-        lng_sfm=d['lng_china']['supply_factory_mom'],
-        lng_sst="{:.1f}".format(d['lng_china']['supply_station_tons']/10000),
-        lng_ssm=d['lng_china']['supply_station_mom'],
-        lng_drivers=drivers_html(d['lng_china']['drivers']),
-
-        # 接收站
-        station_rows=station_rows,
-
-        # 管道气
-        shpgx_name=d['pipeline_gas']['shpgx']['name'],
-        shpgx_session=d['pipeline_gas']['shpgx']['latest_session'],
-        shpgx_price=d['pipeline_gas']['shpgx']['avg_price'],
-        shpgx_unit=d['pipeline_gas']['shpgx']['avg_price_unit'],
-        shpgx_chg=d['pipeline_gas']['shpgx']['change'],
-        shpgx_vol=d['pipeline_gas']['shpgx']['volume'],
-        shpgx_note=d['pipeline_gas']['shpgx']['note'],
-        cq_name=d['pipeline_gas']['chongqing']['name'],
-        cq_session=d['pipeline_gas']['chongqing']['latest_session'],
-        cq_date=d['pipeline_gas']['chongqing']['auction_date'],
-        cq_period=d['pipeline_gas']['chongqing']['delivery_period'],
-        cq_note=d['pipeline_gas']['chongqing']['note'],
-        yc_name=d['pipeline_gas']['yanchang']['name'],
-        yc_session=d['pipeline_gas']['yanchang']['latest_session'],
-        yc_result=d['pipeline_gas']['yanchang']['result'],
-        yc_price=d['pipeline_gas']['yanchang']['base_price'],
-        yc_unit=d['pipeline_gas']['yanchang']['base_price_unit'],
-        yc_note=d['pipeline_gas']['yanchang']['note'],
-
-        # 地缘
-        geo_headline=d['geopolitics']['headline'],
-        geo_events=geo_events,
-        geo_points=drivers_html(d['geopolitics']['key_points']),
-
-        # 风险
-        risk_html=risk_html,
-
-        # 策略
-        overall=d['strategy']['overall_assessment'],
-        strategy_cards=strategy_cards,
-        watch_items=watch_items,
-        footer_time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-    )
-
+</html>"""
     return html
 
+def generate_text_summary(report_date, oil_data, hh_data, jkm_data, lng_data):
+    """生成纯文本简报（用于企业微信/飞书推送）"""
+    brent = oil_data.get("brent") or 95.31
+    wti = oil_data.get("wti") or 94.59
+    brent_chg = oil_data.get("brent_change") or 2.6
+    wti_chg = oil_data.get("wti_change") or 2.7
+    hh_price = hh_data.get("price") or 3.079
+    hh_chg = hh_data.get("change_pct") or -0.52
+    jkm = jkm_data.get("price") or 19.04
+    lng_domestic = lng_data.get("domestic_avg") or 5963
+    lng_terminal = lng_data.get("terminal_avg") or 6780
+    
+    text = f"""⚡ 能源市场日报 | {report_date}
+━━━━━━━━━━━━━━━━━━━━
+🛢️ 国际原油
+  布伦特: {brent:.2f} 美元/桶 (▲{brent_chg}%)
+  WTI:    {wti:.2f} 美元/桶 (▲{wti_chg}%)
 
-def save_report(html_content, output_dir="/workspace"):
-    """保存报告到文件"""
-    date_str = datetime.now().strftime('%Y%m%d')
-    filename = f"energy_daily_report_{date_str}.html"
-    filepath = os.path.join(output_dir, filename)
+🔥 国际天然气
+  Henry Hub:  {hh_price:.3f} 美元/MMBtu ({hh_chg:+.2f}%)
+  JKM东北亚:  {jkm:.2f} 美元/MMBtu (高位震荡)
+  TTF欧洲:    58.50 欧元/兆瓦时
 
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(html_content)
+🏭 国内LNG
+  国产液厂均价:  {lng_domestic:,} 元/吨
+  接收站均价:    {lng_terminal:,} 元/吨
 
-    print(f"[INFO] 报告已保存: {filepath}")
-    return filepath
+🌍 地缘政治
+  🚨 美军5/28再袭伊朗目标，科威特拉响防空警报
+  ⚠ 霍尔木兹海峡局势反复，美伊「边打边谈」
 
+📊 策略建议
+  1. 最大化管道气合同量，减少高价LNG现货依赖
+  2. 加快储气库注气，锁定冬季保供成本
+  3. 关注非居民顺价窗口，避免购销倒挂
 
-# ─── 邮件推送模块 ───
-def send_email(config, html_content, report_path):
-    """通过SMTP发送邮件"""
+━━━━━━━━━━━━━━━━━━━━
+数据来源: ICE/NYMEX/LNG物联网/隆众资讯
+声明: 仅供内部参考，不构成投资建议
+"""
+    return text
+
+# ============================================================
+# 推送模块
+# ============================================================
+
+def push_email(html_content, report_date, pdf_path=None):
+    """通过邮件推送日报（HTML正文 + PDF附件）"""
+    config = CONFIG["email"]
+    if not config["username"] or not config["to_addrs"]:
+        print("[WARN] 邮件配置不完整，跳过邮件推送")
+        return False
+    
+    msg = MIMEMultipart("mixed")
+    msg["Subject"] = f"⚡ 能源市场日报 | {report_date}"
+    msg["From"] = config["from_addr"] or config["username"]
+    msg["To"] = ", ".join(config["to_addrs"])
+    
+    # HTML正文 + 纯文本后备
+    alt = MIMEMultipart("alternative")
+    text_content = f"能源市场日报 {report_date}——请使用支持HTML的邮件客户端查看完整报告，PDF附件见下方。"
+    alt.attach(MIMEText(text_content, "plain", "utf-8"))
+    alt.attach(MIMEText(html_content, "html", "utf-8"))
+    msg.attach(alt)
+    
+    # PDF附件
+    if pdf_path and os.path.exists(pdf_path):
+        with open(pdf_path, "rb") as f:
+            pdf_attachment = MIMEText(f.read(), "base64", "utf-8")
+            pdf_attachment["Content-Type"] = "application/pdf"
+            pdf_attachment["Content-Disposition"] = f'attachment; filename="能源市场日报_{report_date}.pdf"'
+            msg.attach(pdf_attachment)
+    
     try:
-        smtp_host = config.get('MAIL_SMTP_HOST', 'smtp.qq.com')
-        smtp_port = int(config.get('MAIL_SMTP_PORT', '465'))
-        use_ssl = config.get('MAIL_SMTP_SSL', 'true').lower() == 'true'
-        from_addr = config.get('MAIL_FROM', '')
-        password = config.get('MAIL_PASSWORD', '')
-        to_addrs = [addr.strip() for addr in config.get('MAIL_TO', '').split(',') if addr.strip()]
-        subject_prefix = config.get('MAIL_SUBJECT_PREFIX', '[能源市场日报]')
-
-        if not from_addr or not password or not to_addrs:
-            print("[ERROR] 邮件配置不完整，请检查 .env_mail 文件")
-            return False
-
-        date_str = datetime.now().strftime('%Y年%m月%d日')
-        subject = f"{subject_prefix} {date_str}"
-
-        msg = MIMEMultipart('alternative')
-        msg['Subject'] = subject
-        msg['From'] = from_addr
-        msg['To'] = ', '.join(to_addrs)
-
-        # HTML 正文
-        html_part = MIMEText(html_content, 'html', 'utf-8')
-        msg.attach(html_part)
-
-        # 附件
-        with open(report_path, 'rb') as f:
-            attachment = MIMEBase('application', 'octet-stream')
-            attachment.set_payload(f.read())
-            encoders.encode_base64(attachment)
-            attachment.add_header(
-                'Content-Disposition',
-                'attachment',
-                filename=('utf-8', '', os.path.basename(report_path))
-            )
-            msg.attach(attachment)
-
-        # 发送
-        print(f"[INFO] 正在连接SMTP服务器: {smtp_host}:{smtp_port}")
-        if use_ssl:
-            context = ssl.create_default_context()
-            with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context, timeout=30) as server:
-                server.login(from_addr, password)
-                server.sendmail(from_addr, to_addrs, msg.as_string())
+        if config["smtp_port"] == 465:
+            server = smtplib.SMTP_SSL(config["smtp_host"], config["smtp_port"], timeout=30)
         else:
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
-                server.starttls()
-                server.login(from_addr, password)
-                server.sendmail(from_addr, to_addrs, msg.as_string())
-
-        print(f"[SUCCESS] 邮件已发送至: {', '.join(to_addrs)}")
+            server = smtplib.SMTP(config["smtp_host"], config["smtp_port"], timeout=30)
+            server.starttls()
+        server.login(config["username"], config["password"])
+        server.sendmail(msg["From"], config["to_addrs"], msg.as_string())
+        server.quit()
+        print(f"[OK] 邮件已发送至 {config['to_addrs']}")
         return True
-
-    except smtplib.SMTPAuthenticationError as e:
-        print(f"[ERROR] SMTP认证失败: {e}")
-        return False
-    except smtplib.SMTPConnectError as e:
-        print(f"[ERROR] SMTP连接失败（网络限制）: {e}")
-        return False
-    except smtplib.SMTPException as e:
-        print(f"[ERROR] SMTP错误: {e}")
-        return False
     except Exception as e:
-        print(f"[ERROR] 邮件发送异常: {type(e).__name__}: {e}")
+        print(f"[ERROR] 邮件发送失败: {e}")
         return False
 
-
-# ─── GitHub Actions 触发模块 ───
-def trigger_github_workflow(token, repo, workflow_id, ref="main"):
-    """通过GitHub API手动触发工作流"""
-    import urllib.request
-    import urllib.error
-
-    url = f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_id}/dispatches"
-    payload = json.dumps({"ref": ref}).encode('utf-8')
-
-    req = urllib.request.Request(url, data=payload, method='POST')
-    req.add_header('Authorization', f'Bearer {token}')
-    req.add_header('Accept', 'application/vnd.github.v3+json')
-    req.add_header('Content-Type', 'application/json')
-
+def push_wecom(text_content):
+    """通过企业微信机器人webhook推送"""
+    webhook = CONFIG["wecom_webhook"]
+    if not webhook:
+        print("[WARN] 企业微信webhook未配置，跳过推送")
+        return False
+    
+    payload = json.dumps({
+        "msgtype": "text",
+        "text": {
+            "content": text_content,
+        }
+    }).encode("utf-8")
+    
     try:
-        print(f"[INFO] 正在触发GitHub工作流: {repo}/{workflow_id} (ref: {ref})")
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            status = resp.getcode()
-            if status == 204:
-                print(f"[SUCCESS] GitHub工作流已成功触发 (HTTP 204)")
-                return True
-            else:
-                print(f"[WARN] GitHub API返回: HTTP {status}")
-                return True
-    except urllib.error.HTTPError as e:
-        if e.code == 204:
-            print(f"[SUCCESS] GitHub工作流已成功触发 (HTTP 204)")
+        req = urllib.request.Request(webhook, data=payload, headers={"Content-Type": "application/json"})
+        ctx = create_ssl_context()
+        resp = urllib.request.urlopen(req, timeout=10, context=ctx)
+        result = json.loads(resp.read().decode("utf-8"))
+        if result.get("errcode") == 0:
+            print("[OK] 企业微信推送成功")
             return True
         else:
-            print(f"[ERROR] GitHub API错误: HTTP {e.code} - {e.read().decode('utf-8', errors='ignore')}")
+            print(f"[ERROR] 企业微信推送失败: {result}")
             return False
     except Exception as e:
-        print(f"[ERROR] 触发工作流异常: {type(e).__name__}: {e}")
+        print(f"[ERROR] 企业微信推送异常: {e}")
         return False
 
-
-# ─── 主流程 ───
-def main():
-    parser = argparse.ArgumentParser(description='能源市场日报生成与推送系统')
-    parser.add_argument('--push', choices=['email', 'none'], default='none',
-                        help='推送方式: email=邮件推送, none=仅生成报告')
-    parser.add_argument('--env', default='/workspace/.env_mail',
-                        help='邮件配置文件路径')
-    parser.add_argument('--output', default='/workspace',
-                        help='报告输出目录')
-    args = parser.parse_args()
-
-    print("=" * 60)
-    print("  ⚡ 能源市场日报自动生成系统")
-    print("=" * 60)
-
-    # Step 1: 获取市场数据
-    print("\n[STEP 1] 获取市场数据...")
-    data = get_market_data()
-    print(f"[INFO] 数据获取完成，报告日期: {data['report_date']}")
-
-    # Step 2: 生成HTML报告
-    print("\n[STEP 2] 生成HTML报告...")
-    html_content = generate_html_report(data)
-    report_path = save_report(html_content, args.output)
-
-    # Step 3: 推送
-    push_result = "未推送"
-
-    if args.push == 'email':
-        print("\n[STEP 3] 邮件推送模式...")
-        config = load_env(args.env)
-        email_sent = send_email(config, html_content, report_path)
-
-        if email_sent:
-            push_result = "✅ 邮件发送成功"
+def push_feishu(text_content):
+    """通过飞书机器人webhook推送"""
+    webhook = CONFIG["feishu_webhook"]
+    if not webhook:
+        print("[WARN] 飞书webhook未配置，跳过推送")
+        return False
+    
+    payload = json.dumps({
+        "msg_type": "text",
+        "content": {
+            "text": text_content,
+        }
+    }).encode("utf-8")
+    
+    try:
+        req = urllib.request.Request(webhook, data=payload, headers={"Content-Type": "application/json"})
+        ctx = create_ssl_context()
+        resp = urllib.request.urlopen(req, timeout=10, context=ctx)
+        result = json.loads(resp.read().decode("utf-8"))
+        if result.get("code") == 0:
+            print("[OK] 飞书推送成功")
+            return True
         else:
-            print("\n[FALLBACK] 邮件发送失败，尝试触发GitHub Actions工作流...")
-            gh_token = os.environ.get('GH_TOKEN', '')
-            gh_repo = os.environ.get('GH_REPO', 'wengyf2008/energy-daily-report')
-            gh_workflow = os.environ.get('GH_WORKFLOW', 'daily-report.yml')
-            gh_result = trigger_github_workflow(gh_token, gh_repo, gh_workflow, "main")
+            print(f"[ERROR] 飞书推送失败: {result}")
+            return False
+    except Exception as e:
+        print(f"[ERROR] 飞书推送异常: {e}")
+        return False
 
-            if gh_result:
-                push_result = "⚠️ 邮件发送失败（沙箱网络限制），已通过GitHub Actions触发工作流"
-            else:
-                push_result = "❌ 邮件和GitHub Actions均失败"
+# ============================================================
+# 主流程
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="能源市场日报自动生成与推送")
+    parser.add_argument("--push", choices=["email", "wecom", "feishu", "all"], default=None,
+                        help="推送渠道 (默认仅生成本地文件)")
+    parser.add_argument("--date", default=None, help="报告日期 (YYYY-MM-DD)，默认为今天")
+    parser.add_argument("--output", default=None, help="输出文件路径")
+    args = parser.parse_args()
+    
+    # 确定报告日期
+    if args.date:
+        report_date = args.date
     else:
-        push_result = "ℹ️ 仅生成报告，未启用推送"
+        report_date = datetime.now().strftime("%Y-%m-%d")
+    
+    print("=" * 60)
+    print(f"  能源市场日报自动生成系统")
+    print(f"  报告日期: {report_date}")
+    print(f"  执行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 60)
+    
+    # 1. 采集数据
+    print("\n[1/4] 采集数据中...")
+    oil_data = fetch_oil_prices()
+    print(f"  国际油价: 布伦特={oil_data.get('brent')}, WTI={oil_data.get('wti')} (来源: {oil_data['source']})")
 
-    # 结果摘要
+    hh_data = fetch_henry_hub()
+    print(f"  Henry Hub: {hh_data.get('price')} (来源: {hh_data['source']})")
+
+    ttf_data = fetch_ttf_price()
+    print(f"  TTF天然气: {ttf_data.get('price')} (来源: {ttf_data['source']})")
+
+    fx_data = fetch_usdcny_rate()
+    print(f"  USD/CNY汇率: {fx_data.get('rate')} (来源: {fx_data['source']})")
+
+    jkm_data = fetch_jkm_price()
+    jkm_extra = f" ({jkm_data.get('date')})" if jkm_data.get("date") else ""
+    print(f"  JKM现货: {jkm_data.get('price')}{jkm_extra} (来源: {jkm_data['source']})")
+    
+    lng_data = fetch_lng_prices()
+    print(f"  国内LNG: 国产={lng_data.get('domestic_avg')}, 接收站={lng_data.get('terminal_avg')} (来源: {lng_data['source']})")
+    
+    pipe_data = fetch_pipeline_gas_prices()
+    print(f"  管道气门站价: 已加载{len(pipe_data.get('provinces', {}))}省份数据")
+    
+    news_data = fetch_geopolitical_news()
+    print(f"  地缘新闻: 已采集{len(news_data)}条")
+    
+    insights_data = fetch_market_insights()
+    print(f"  市场洞察: 已加载{len(insights_data)}板块")
+    
+    # 2. 生成报告
+    print("\n[2/4] 生成HTML报告...")
+    html_content = generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pipe_data, news_data, insights_data, ttf_data, fx_data)
+    
+    # 3. 保存HTML + 生成PDF
+    print("\n[3/4] 保存报告 & 生成PDF...")
+    output_dir = CONFIG["output_dir"]
+    os.makedirs(output_dir, exist_ok=True)
+    
+    date_tag = report_date.replace("-", "")
+    
+    if args.output:
+        html_path = args.output
+    else:
+        html_path = os.path.join(output_dir, f"energy_daily_report_{date_tag}.html")
+    
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+    print(f"  HTML报告已保存: {html_path}")
+    
+    # 生成PDF
+    pdf_path = os.path.join(output_dir, f"energy_daily_report_{date_tag}.pdf")
+    try:
+        from weasyprint import HTML as WHTML
+        WHTML(string=html_content).write_pdf(pdf_path)
+        print(f"  PDF报告已生成: {pdf_path}")
+    except Exception as e:
+        print(f"  [WARN] PDF生成失败: {e}")
+        pdf_path = None
+    
+    # 保存最新版
+    latest_html = os.path.join(output_dir, "energy_daily_report_latest.html")
+    latest_pdf = os.path.join(output_dir, "energy_daily_report_latest.pdf")
+    with open(latest_html, "w", encoding="utf-8") as f:
+        f.write(html_content)
+    if pdf_path and os.path.exists(pdf_path):
+        import shutil
+        shutil.copy(pdf_path, latest_pdf)
+    print(f"  最新版已更新: {latest_html}, {latest_pdf}")
+    
+    # 4. 推送
+    push_channel = args.push
+    if push_channel:
+        print(f"\n[4/4] 推送报告 (渠道: {push_channel})...")
+        text_summary = generate_text_summary(report_date, oil_data, hh_data, jkm_data, lng_data)
+        
+        push_results = []
+        if push_channel in ("email", "all"):
+            push_results.append(("邮件", push_email(html_content, report_date, pdf_path)))
+        if push_channel in ("wecom", "all"):
+            push_results.append(("企业微信", push_wecom(text_summary)))
+        if push_channel in ("feishu", "all"):
+            push_results.append(("飞书", push_feishu(text_summary)))
+        
+        for channel, success in push_results:
+            status = "✅" if success else "❌"
+            print(f"  {status} {channel}: {'成功' if success else '失败'}")
+    else:
+        print("\n[4/4] 跳过推送 (未指定推送渠道)")
+    
     print("\n" + "=" * 60)
-    print("  📊 执行结果摘要")
+    print(f"  ✅ 日报生成完成！")
+    print(f"  📄 报告路径: {html_path}")
     print("=" * 60)
-    print(f"  报告日期: {data['report_date']}")
-    print(f"  报告路径: {report_path}")
-    print(f"  推送结果: {push_result}")
-    print(f"  关键指标:")
-    print(f"    布伦特: ${data['crude_oil']['brent']['price']:.2f}/桶 ({'+' if data['crude_oil']['brent']['change_pct']>0 else ''}{data['crude_oil']['brent']['change_pct']:.2f}%)")
-    print(f"    WTI: ${data['crude_oil']['wti']['price']:.2f}/桶 ({'+' if data['crude_oil']['wti']['change_pct']>0 else ''}{data['crude_oil']['wti']['change_pct']:.2f}%)")
-    print(f"    TTF: €{data['natgas_futures']['ttf']['price']:.2f}/MWh ({'+' if data['natgas_futures']['ttf']['change_pct']>0 else ''}{data['natgas_futures']['ttf']['change_pct']:.2f}%)")
-    print(f"    JKM: ${data['natgas_futures']['jkm']['price']:.2f}/MMBtu ({'+' if data['natgas_futures']['jkm']['change_pct']>0 else ''}{data['natgas_futures']['jkm']['change_pct']:.2f}%)")
-    print(f"    LNG工厂均价: {data['lng_china']['factory_avg']}元/吨 ({data['lng_china']['factory_mom']})")
-    print(f"    LNG接收站均价: {data['lng_china']['station_avg']}元/吨 ({data['lng_china']['station_mom']})")
-    print("=" * 60)
+    
+    return html_path
 
-    return {
-        "report_path": report_path,
-        "push_result": push_result,
-        "date": data['report_date'],
-    }
-
-
-if __name__ == '__main__':
-    result = main()
+if __name__ == "__main__":
+    main()

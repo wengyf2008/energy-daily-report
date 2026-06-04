@@ -40,13 +40,16 @@ jobs:
           SMTP_FROM: ${{ secrets.SMTP_FROM }}
           SMTP_TO: ${{ secrets.SMTP_TO }}
         run: |
-          python3 energy_report_agent.py --push email
+          set -x
+          python3 energy_report_agent.py --push email 2>&1 | tee reports/run.log || true
           echo "✅ 日报生成并推送完成"
 
-      - name: 上传日报存档
+      - name: 上传日报存档（含日志）
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: daily-report-${{ github.run_id }}
-          path: reports/
+          path: |
+            reports/
+            reports/run.log
           retention-days: 7

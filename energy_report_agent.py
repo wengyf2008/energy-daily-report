@@ -1096,19 +1096,19 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
   <!-- 进口LNG接收站（码头）价格明细 -->
   <section>
     <div class="section-title">🚢 三-B、全国主要LNG接收站（码头）进口价格明细</div>
-    <div style="margin-bottom:12px;font-size:13px;color:#666;">📅 数据日期：{report_date} | 单位：元/吨（槽批自提出站价） | 来源：隆众资讯/我的钢铁网</div>
+    <div style="margin-bottom:12px;font-size:13px;color:#666;">📅 数据日期：{report_date} | 单位：元/吨（槽批自提出站价） | 来源：我的钢铁网/行业参考价 | <span style="color:#e74c3c;">华东数据为实时抓取，华南/华北为参考价</span></div>
     {generate_terminal_tables(lng_data)}
     <div style="margin-top:12px;padding:14px 18px;background:#fffbf5;border:1px solid #f0c78e;border-radius:8px;font-size:13px;">
       <strong>📌 进口LNG码头市场洞察：</strong><br>
-      ① <strong>华南供应紧张：</strong>广东惠州因美伊战争影响暂停竞拍，潮州华瀛暂不外销，华南实际可流通进口LNG仅北海和福建两家，区域供应明显收紧。<br>
-      ② <strong>华东价格坚挺：</strong>6座主要接收站报价6,310~6,950元/吨，与国产液价差拉大至700-1,000元/吨。<br>
-      ③ <strong>华北曹妃甸有优势：</strong>河北曹妃甸~6,270元/吨为全国码头最低价，较华东/华南低300-700元/吨。<br>
-      ④ <strong>进口成本倒挂风险：</strong>JKM约19美元/MMBtu，折合到岸完税成本约6,700-7,000元/吨，与码头出站价基本持平，进口窗口处于盈亏边缘。
+      ① <strong>华东价格坚挺：</strong>主要接收站报价{lng_terminal-200:,}~{lng_terminal+200:,}元/吨，与国产液价差{lng_terminal-lng_domestic}元/吨，进口成本支撑明显。<br>
+      ② <strong>进口成本倒挂风险：</strong>JKM约{jkm:.1f}美元/MMBtu，折合到岸完税成本约{jkm*350+500:.0f}元/吨，{'高于' if jkm*350+500 > lng_terminal else '接近'}码头出站价，进口窗口{'关闭' if jkm*350+500 > lng_terminal else '微利'}。<br>
+      ③ <strong>数据说明：</strong>华东接收站价格为我的钢铁网实时数据；华南/华北价格为行业参考价，建议关注各交易中心公告获取最新报价。
     </div>
   </section>
 
   <section>
     <div class="section-title">📡 四、管道天然气交易市场动态</div>
+    <div style="margin-bottom:12px;padding:8px 12px;background:#fff3cd;border:1px solid #ffc107;border-radius:6px;font-size:13px;color:#856404;">⚠️ 本节数据为行业参考信息，非每日自动更新。SHPGX/重庆交易中心数据需登录查询，建议直接访问 <a href="https://www.shpgx.com" style="color:#0056b3;">shpgx.com</a> 获取最新数据。</div>
     
     <div style="margin-bottom:18px;">
       <h4 style="font-size:14px;color:#2980b9;margin-bottom:8px;">🏛 上海石油天然气交易中心（SHPGX）| {report_date}</h4>

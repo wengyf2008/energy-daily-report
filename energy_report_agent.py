@@ -331,52 +331,75 @@ def fetch_usdcny_rate():
 def fetch_mysteel_lng_terminals():
     """
     从我的钢铁网（Mysteel）抓取华东LNG接收站价格汇总表
-    策略：尝试今天日期URL → 昨天 → 前天的文章（三日内有效）
+    策略：1. 用Google搜索找最新文章URL → 2. 抓取文章内容 → 3. 解析价格
     返回: list of dicts [{name, company, province, price, change, note}, ...]
     """
     terminals = []
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     }
+    article_url = None
 
-    # 已知的文章hash（6月1日）。今天/昨天的文章尝试同样hash
-    known_hashes = [
-        "8C84510163471331",
-        "29BD28945AE4E5E6",  # 全国LNG汇总的hash也试试
-    ]
-    hours = ["10", "08", "09", "11", "14", "15"]  # 常用发布时间
+    # 策略1: 用 Google 搜索最新文章
+    try:
+        import urllib.parse as _urlparse
+        search_q = _urlparse.quote("site:nenghua.mysteel.com 华东LNG接收站价格汇总表")
+        google_url = f"https://www.google.com/search?q={search_q}&tbs=qdr:w&num=5"
+        search_text = http_get(google_url, headers=headers, timeout=15)
+        if search_text:
+            found_urls = re.findall(r'(https://nenghua\.mysteel\.com/a/\d{8}/\w+\.html)', search_text)
+            if found_urls:
+                article_url = found_urls[0]
+    except Exception:
+        pass
 
-    today = datetime.now()
-    article_text = None
+    # 策略2: 用 Bing 搜索
+    if not article_url:
+        try:
+            import urllib.parse as _urlparse
+            search_q = _urlparse.quote("site:nenghua.mysteel.com LNG接收站价格汇总")
+            bing_url = f"https://www.bing.com/search?q={search_q}&qft=interval%3d%227%22&filters=ex1%3a%22ez5_19869_19870%22"
+            search_text = http_get(bing_url, headers=headers, timeout=15)
+            if search_text:
+                found_urls = re.findall(r'(https://nenghua\.mysteel\.com/a/\d{8}/\w+\.html)', search_text)
+                if found_urls:
+                    article_url = found_urls[0]
+        except Exception:
+            pass
 
-    # 尝试找最近三天的文章（静默请求，失败不打印WARN）
-    for days_back in range(3):
-        d = today - timedelta(days=days_back)
-        date_prefix = d.strftime("%y%m%d")
-        for h in hours:
-            for kh in known_hashes:
-                url = f"https://nenghua.mysteel.com/a/{date_prefix}{h}/{kh}.html"
-                # 静默HTTP请求（404是预期的）
-                try:
-                    req = urllib.request.Request(url, headers=headers)
-                    ctx = ssl.create_default_context()
-                    resp = urllib.request.urlopen(req, timeout=10, context=ctx)
-                    text = resp.read().decode("utf-8", errors="ignore")
-                except Exception:
-                    continue
-                if text and "液化天然气" in text and ("中石油" in text or "广汇" in text):
-                    article_text = text
-                    article_url = url
+    # 策略3: 基于已知hash尝试最近3天的URL（旧方案兜底）
+    if not article_url:
+        known_hashes = ["8C84510163471331", "29BD28945AE4E5E6"]
+        hours = ["10", "08", "09", "11", "14", "15"]
+        today = datetime.now()
+        for days_back in range(3):
+            d = today - timedelta(days=days_back)
+            date_prefix = d.strftime("%y%m%d")
+            for h in hours:
+                for kh in known_hashes:
+                    url = f"https://nenghua.mysteel.com/a/{date_prefix}{h}/{kh}.html"
+                    try:
+                        req = urllib.request.Request(url, headers=headers)
+                        ctx = ssl.create_default_context()
+                        resp = urllib.request.urlopen(req, timeout=8, context=ctx)
+                        text = resp.read().decode("utf-8", errors="ignore")
+                    except Exception:
+                        continue
+                    if text and "液化天然气" in text and ("中石油" in text or "广汇" in text):
+                        article_url = url
+                        break
+                if article_url:
                     break
-            if article_text:
+            if article_url:
                 break
-        if article_text:
-            break
 
-    if not article_text:
+    if not article_url:
         return terminals
 
-    # 解析终端价格数据
+    # 抓取文章内容
+    article_text = http_get(article_url, headers=headers, timeout=15)
+    if not article_text:
+        return terminals
     records = re.findall(
         r'液化天然气(江苏省|浙江省|上海市|山东省|福建省|广东省|广西壮族自治区|广西|海南省|河北省|天津市|辽宁省)'
         r'([\u4e00-\u9fa5（）()A-Za-z0-9]+?)(\d+)\s*元/吨',
@@ -666,84 +689,144 @@ def fetch_jkm_price():
     return data
 
 def fetch_geopolitical_news():
-    """采集地缘政治要闻"""
-    # 在实际部署中，可接入新闻API（如newsapi.org）或RSS
-    # 这里返回手工整理的最新要闻
-    news = [
-        {
-            "date": "2026-05-29",
-            "title": "美军持续打击伊朗军事设施，霍尔木兹海峡航运中断风险升级",
-            "summary": "美军中央司令部连续第三天对伊朗南部及沿海军事目标实施精确打击，伊朗革命卫队宣布进入最高战备状态。海湾国家科威特、巴林、卡塔尔先后拉响防空警报，多国呼吁公民撤离伊朗。",
-            "impact": "布伦特站稳95美元上方，日内波动超3%",
-            "source": "新华社/路透社",
-        },
-        {
-            "date": "2026-05-28",
-            "title": "美军再次空袭伊朗境内目标，科威特拉响防空警报",
-            "summary": "美军中央司令部对伊朗南部阿巴斯港附近军事目标发动新一轮打击，同时伊朗革命卫队宣布对美军基地实施报复。",
-            "impact": "油价日内涨超2.6%",
-            "source": "凤凰网财经/新华社",
-        },
-        {
-            "date": "2026-05-25",
-            "title": "美军深夜空袭伊朗阿巴斯港，霍尔木兹再起波澜",
-            "summary": "美军摧毁两艘伊朗布雷艇并打击阿巴斯港防空导弹阵地，双方随即短暂交火。",
-            "impact": "布伦特短线跳水后反弹，盘中V形反转",
-            "source": "腾讯新闻/搜狐",
-        },
-        {
-            "date": "2026-05-24",
-            "title": "美伊就全面开放霍尔木兹海峡达成框架协议",
-            "summary": "华盛顿邮报报道美伊就谅解备忘录框架达成一致，30天内全面恢复霍尔木兹海峡航运，延长停火60天。",
-            "impact": "布伦特单日大跌至92美元附近",
-            "source": "新华社",
-        },
-        {
-            "date": "2026-05-20",
-            "title": "伊朗威胁封锁霍尔木兹海峡，全球LNG贸易高度紧张",
-            "summary": "伊朗议会通过决议授权政府在必要时封锁霍尔木兹海峡，卡塔尔LNG出口船队暂缓通行。全球约20%的LNG贸易需经此海峡。",
-            "impact": "JKM单日飙升12%，TTF同步跟涨",
-            "source": "路透社/Platts",
-        },
+    """从 Google News RSS 采集地缘政治与能源要闻"""
+    news = []
+    import urllib.parse as _urlparse
+
+    # 搜索关键词及对应RSS
+    rss_queries = [
+        ("Iran oil energy Hormuz", "en-US", "US:en"),
+        ("Brent WTI crude oil price OPEC", "en-US", "US:en"),
+        ("natural gas LNG market Asia", "en-US", "US:en"),
     ]
-    return news
+
+    seen_titles = set()
+    for q, hl, ceid in rss_queries:
+        try:
+            encoded_q = _urlparse.quote(q)
+            url = f"https://news.google.com/rss/search?q={encoded_q}&hl={hl}&gl=US&ceid={ceid}"
+            text = http_get(url, timeout=15)
+            if not text:
+                continue
+
+            # 解析RSS中的item
+            items = re.findall(
+                r'<item>.*?<title>(.*?)</title>.*?<pubDate>(.*?)</pubDate>.*?<link>(.*?)</link>.*?</item>',
+                text, re.DOTALL
+            )
+            for title_raw, pub_date, link in items:
+                title = title_raw.replace('<![CDATA[', '').replace(']]>', '').strip()
+                if title in seen_titles or title.startswith('"'):
+                    continue
+                seen_titles.add(title)
+
+                # 解析日期
+                date_str = pub_date.strip()
+                try:
+                    from email.utils import parsedate_to_datetime
+                    dt = parsedate_to_datetime(date_str)
+                    date_fmt = dt.strftime("%Y-%m-%d")
+                except Exception:
+                    date_fmt = date_str[:16]
+
+                # 推断市场影响
+                impact = "市场关注中"
+                t_lower = title.lower()
+                if any(w in t_lower for w in ['surge', 'jump', 'spike', 'soar', 'rally', '大涨', '飙升']):
+                    impact = "油价/气价上涨压力"
+                elif any(w in t_lower for w in ['drop', 'fall', 'plunge', 'slide', '大跌', '回落']):
+                    impact = "油价/气价下行"
+                elif any(w in t_lower for w in ['iran', 'hormuz', 'attack', 'strike', 'war', 'conflict']):
+                    impact = "地缘风险推升能源价格"
+                elif any(w in t_lower for w in ['opec', 'production cut', 'supply']):
+                    impact = "供应端变化影响油价"
+                elif any(w in t_lower for w in ['demand', 'china', 'inventory']):
+                    impact = "需求端变化影响油价"
+
+                news.append({
+                    "date": date_fmt,
+                    "title": title[:120],
+                    "summary": "",
+                    "impact": impact,
+                    "source": "Google News",
+                })
+        except Exception as e:
+            print(f"[WARN] Google News RSS失败({q[:20]}): {e}")
+
+    # 按日期降序排列，取前8条
+    news.sort(key=lambda x: x["date"], reverse=True)
+    return news[:8]
 
 
-def fetch_market_insights():
-    """各板块市场洞察数据（日度更新）"""
+def fetch_market_insights(oil_data=None, hh_data=None, ttf_data=None, jkm_data=None, lng_data=None):
+    """基于当日实际价格数据动态生成市场洞察"""
+    # 获取当前价格，缺失则用默认值
+    brent = (oil_data or {}).get("brent") or 95.0
+    wti = (oil_data or {}).get("wti") or 93.0
+    brent_chg = (oil_data or {}).get("brent_change") or 0
+    hh = (hh_data or {}).get("price") or 3.0
+    hh_chg = (hh_data or {}).get("change_pct") or 0
+    ttf = (ttf_data or {}).get("price") or 50.0
+    ttf_chg = (ttf_data or {}).get("change_pct") or 0
+    jkm = (jkm_data or {}).get("price") or 19.0
+    jkm_chg = (jkm_data or {}).get("change_pct") or 0
+    lng_avg = (lng_data or {}).get("domestic_avg") or 6000
+    term_avg = (lng_data or {}).get("terminal_avg") or 6800
+    op_rate = (lng_data or {}).get("operating_rate") or 47
+
+    # 涨跌方向判断
+    def _dir(val, threshold=0.5):
+        if val > threshold: return "上涨"
+        elif val < -threshold: return "下跌"
+        else: return "窄幅波动"
+
+    oil_dir = _dir(brent_chg)
+    hh_dir = _dir(hh_chg)
+    ttf_dir = _dir(ttf_chg)
+
+    # 原油洞察
+    if brent > 100:
+        oil_headline = f"布伦特突破{brent:.0f}美元，地缘风险溢价持续攀升"
+    elif brent > 90:
+        oil_headline = f"布伦特守稳{brent:.0f}美元上方，{oil_dir}格局延续"
+    elif brent > 80:
+        oil_headline = f"布伦特{brent:.0f}美元附近{oil_dir}，市场多空交织"
+    else:
+        oil_headline = f"布伦特回落至{brent:.0f}美元，油价承压{oil_dir}"
+
     insights = {
         "oil": {
-            "headline": "美伊冲突主导油价走向，布伦特站稳95美元",
+            "headline": oil_headline,
             "drivers": [
-                ("🇺🇸🇮🇷 美伊冲突升级", "美军连续打击伊朗沿海军事设施，霍尔木兹海峡通行风险上升，市场对供应中断的担忧持续推升油价。冲突以来布伦特累计涨幅超25%。"),
-                ("🛢️ OPEC+增产预期", "沙特表示若霍尔木兹海峡持续受阻，将释放剩余产能弥补供应缺口，但市场对其实际补偿能力存疑。"),
-                ("📉 EIA库存意外下降", "最新一周美国原油库存减少580万桶，远超市场预期，炼厂开工率回升至93%，需求端支撑油价。"),
-                ("🇨🇳 中国需求修复", "5月中国原油加工量环比回升，炼厂利润改善推动采购增加，但整体需求仍低于去年同期。"),
+                (f"📊 布伦特{brent:.2f}美元({brent_chg:+.1f}%)", f"WTI报{wti:.2f}美元({(oil_data or {}).get('wti_change', 0):+.1f}%)，价差{wti-brent:.2f}美元。油价日内{oil_dir}，反映当前市场对供需和地缘风险的定价。"),
+                ("🇺🇸🇮🇷 中东局势", "美伊冲突持续影响霍尔木兹海峡航运安全，市场对原油供应中断保持警惕。冲突走向仍是油价短期最大变量。"),
+                ("🛢️ OPEC+供应", "沙特等国表态将在必要时释放剩余产能，但实际补偿能力存疑。OPEC+下次会议将讨论产量调整。"),
+                ("📉 需求前景", "中国炼厂开工回升支撑需求预期，但全球经济增长放缓限制油价上方空间。EIA库存变化需持续关注。"),
             ],
-            "outlook": "短期油价在90-100美元区间高位震荡，方向取决于美伊谈判进展。若达成停火协议，布伦特可能快速回落至85美元；若冲突扩大至地面战争，布伦特有望冲击120-150美元。",
-            "impact_on_gas": "油价上涨通过JCC挂钩机制推升LNG长协价格，预计3-6个月后传导至国内进口成本。当前布伦特95美元对应下半年LNG长协到岸价约14-16美元/MMBtu。",
+            "outlook": f"布伦特在{brent-5:.0f}-{brent+5:.0f}美元区间{oil_dir}。若美伊冲突缓和，可能回落至{brent-10:.0f}美元；若局势恶化，有冲击{brent+20:.0f}美元风险。",
+            "impact_on_gas": f"布伦特{brent:.0f}美元对应LNG长协JCC挂钩价约{brent*0.15:.1f}美元/MMBtu，预计3-6个月后传导至国内进口成本。",
         },
         "gas_intl": {
-            "headline": "JKM高位震荡，TTF受欧洲补库支撑",
+            "headline": f"JKM {jkm:.1f}美元{'高位震荡' if jkm > 16 else '区间运行'}，TTF {ttf_dir}至{ttf:.1f}欧元",
             "drivers": [
-                ("🚢 霍尔木兹海峡风险", "卡塔尔LNG出口船队通行受阻或延迟，亚洲买家抢购替代货源，推升JKM现货溢价至19美元以上。"),
-                ("🇪🇺 欧洲补库需求", "EU天然气库存填充率约62%，低于去年同期68%，补库需求支撑TTF价格维持在55-60欧元/MWh区间。"),
-                ("🇺🇸 Henry Hub承压", "美国本土产量维持高位，天气转暖需求下降，HH在3美元附近窄幅波动，与亚洲形成显著价差套利窗口。"),
-                ("🇦🇺 澳大利亚检修", "Gorgon/Wheatstone项目进入年度检修期，减少亚太地区LNG供应量约200万吨/月。"),
+                (f"🚢 JKM {jkm:.1f}美元({jkm_chg:+.1f}%)", f"东北亚LNG现货{'维持高位' if jkm > 16 else '区间波动'}。霍尔木兹海峡通行风险影响卡塔尔LNG出口，亚洲买家溢价采购替代货源。"),
+                (f"🇪🇺 TTF {ttf:.1f}欧元/MWh({ttf_chg:+.1f}%)", f"欧洲天然气{'补库需求支撑价格' if ttf > 45 else '需求疲软价格承压'}。EU库存填充率仍低于去年同期，冬季补库采购将持续。"),
+                (f"🇺🇸 Henry Hub {hh:.3f}美元({hh_chg:+.1f}%)", f"美国本土产量高位运行，{'天气转暖需求下降' if hh < 3.5 else '供需偏紧支撑价格'}。HH与JKM价差{abs(jkm-hh):.1f}美元，{'套利窗口吸引货流东移' if jkm-hh > 10 else '套利空间有限'}。"),
+                ("🌏 亚太供应", "澳大利亚部分LNG项目进入检修期，减少亚太地区现货供应量。美国墨西哥湾LNG出口终端满负荷运行。"),
             ],
-            "outlook": "JKM短期内维持18-22美元/MMBtu高位，若霍尔木兹恢复正常通行则可能回落至14-16美元。HH预计在2.8-3.5美元区间运行，美亚套利空间吸引货流东移。",
-            "impact_on_gas": "JKM高位直接推升中国LNG进口现货成本，折合到岸完税价约6,700-7,000元/吨，与国内接收站出站价基本持平，进口利润窗口处于盈亏边缘。",
+            "outlook": f"JKM短期{'维持{jkm-2:.0f}-{jkm+3:.0f}美元高位' if jkm > 16 else f'{jkm-3:.0f}-{jkm+3:.0f}美元区间运行'}。HH预计在{max(2.0,hh-0.5):.1f}-{hh+0.5:.1f}美元区间。",
+            "impact_on_gas": f"JKM {jkm:.1f}美元折合到岸完税价约{jkm*350+500:.0f}元/吨，{'高于' if jkm*350+500 > term_avg else '接近'}国内接收站出站价{term_avg}元/吨，进口利润窗口{'关闭' if jkm*350+500 > term_avg else '微利'}。",
         },
         "lng_domestic": {
-            "headline": "国产液价低位盘整，接收站价格坚挺",
+            "headline": f"国产液价{lng_avg}元/吨{'盘整' if lng_avg < 6200 else '偏强'}，接收站{term_avg}元/吨{'坚挺' if term_avg > 6500 else '松动'}",
             "drivers": [
-                ("🏭 液厂开工率偏低", "全国133家液厂开工率仅47%，西北/华北液厂因原料气成本偏高主动降负，供应端支撑价格。"),
-                ("📦 接收站进口成本倒挂", "JKM高位推升进口LNG到岸成本，接收站为避免亏损维持出站报价6,300-7,000元/吨区间。"),
-                ("🚫 华南供应紧张", "广东惠州暂停竞拍、潮州华瀛暂不外销，华南区域实际可流通进口LNG货源明显减少。"),
-                ("🌡️ 气温回升需求转弱", "全国大部气温回升，采暖需求消退，下游城燃采购以刚需为主，市场交投清淡。"),
+                (f"🏭 液厂开工率{op_rate}%", f"全国133家液厂开工率{op_rate}%，{'供应偏紧支撑价格' if op_rate < 50 else '供应充足价格承压'}。西北/华北液厂原料气成本偏高。"),
+                (f"📦 接收站均价{term_avg}元/吨", f"进口LNG到岸成本高企，接收站{'维持出站报价坚挺' if term_avg > 6500 else '价格有所松动'}。国产液与接收站价差{term_avg-lng_avg}元/吨。"),
+                ("🌡️ 非采暖季需求", "全国大部气温回升，采暖需求消退，下游城燃采购以刚需为主，市场交投清淡。夏季制冷需求对气电有一定支撑。"),
+                ("💰 进口成本", f"JKM现货{jkm:.1f}美元/MMBtu，折合到岸完税约{jkm*350+500:.0f}元/吨，{'倒挂风险较大' if jkm*350+500 > term_avg else '进口窗口微开'}。"),
             ],
-            "outlook": "非采暖季国产LNG价格预计在5,700-6,200元/吨区间震荡；接收站价格受进口成本支撑维持6,300-7,000元/吨。若6月JKM回落，接收站价格有望松动。",
-            "impact_on_gas": "接收站与国产液价差达700-1,000元/吨，城燃企业采购应优先使用管道气合同量，LNG现货仅作为调峰补充。",
+            "outlook": f"非采暖季国产LNG价格预计在{lng_avg-300}-{lng_avg+200}元/吨区间震荡；接收站价格{'受进口成本支撑维持{term_avg-200}-{term_avg+200}元/吨' if term_avg > 6500 else '有望随JKM回落而松动'}。",
+            "impact_on_gas": f"接收站与国产液价差{term_avg-lng_avg}元/吨，城燃企业{'应优先使用管道气合同量，LNG现货仅作调峰补充' if term_avg-lng_avg > 500 else '可适度增加LNG现货采购降低综合成本'}。",
         },
     }
     return insights
@@ -1326,7 +1409,7 @@ def main():
     news_data = fetch_geopolitical_news()
     print(f"  地缘新闻: 已采集{len(news_data)}条")
     
-    insights_data = fetch_market_insights()
+    insights_data = fetch_market_insights(oil_data, hh_data, ttf_data, jkm_data, lng_data)
     print(f"  市场洞察: 已加载{len(insights_data)}板块")
     
     # 2. 生成报告

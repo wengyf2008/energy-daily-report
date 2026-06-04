@@ -476,8 +476,517 @@ def fetch_mysteel_lng_terminals():
     return terminals
 
 
+def fetch_from_100ppi():
+    """
+    从生意社(trq.100ppi.com)抓取LNG基准价、参考价和液厂报价
+    数据每日更新，免费可抓取
+    返回: {
+        'benchmark': float,        # 基准价（元/吨）
+        'reference': float,        # 参考价（元/吨）
+        'ref_change_pct': float,   # 参考价涨跌幅%
+        'plant_quotes': [{name, province, price, date}, ...],
+        'source': '100ppi'
+    }
+    """
+    result = {
+        "benchmark": None, "reference": None, "ref_change_pct": None,
+        "plant_quotes": [], "source": "100ppi",
+    }
+
+    # 1. 抓取主页面获取基准价和参考价
+    try:
+        main_text = http_get("https://trq.100ppi.com/", timeout=15)
+        if main_text:
+            # 提取基准价: "6月4日生意社液化天然气基准价为5964.00元/吨"
+            bm_match = re.findall(r'(\d{1,2})月(\d{1,2})日生意社液化天然气基准价为([\d.]+)元/吨', main_text)
+            if bm_match:
+                # 取最新的（最后一条，因为列表倒序）
+                latest = bm_match[0]
+                result["benchmark"] = float(latest[2])
+
+            # 提取参考价: "6月4日，液化天然气参考价为5986.00，与6月1日(5846.00)相比，上涨了2.39%"
+            ref_match = re.search(
+                r'(\d{1,2})月(\d{1,2})日，?液化天然气参考价为([\d.]+)，'
+                r'与\d{1,2}月\d{1,2}日\(([\d.]+)\)相比，'
+                r'(上涨|下降)了([\d.]+)%',
+                main_text
+            )
+            if ref_match:
+                result["reference"] = float(ref_match.group(3))
+                change_pct = float(ref_match.group(6))
+                if ref_match.group(5) == "下降":
+                    change_pct = -change_pct
+                result["ref_change_pct"] = change_pct
+
+            print(f"  生意社LNG: 基准价={result['benchmark']}, 参考价={result['reference']}({result['ref_change_pct']:+.2f}%)")
+    except Exception as e:
+        print(f"[WARN] 生意社主页面抓取失败: {e}")
+
+    # 2. 抓取报价页面获取各液厂出厂价
+    try:
+        price_text = http_get("https://www.100ppi.com/price/", timeout=15)
+        if not price_text:
+            price_text = http_get("https://trq.100ppi.com/", timeout=15)  # 备用：从主页抓
+        if price_text:
+            # 清理HTML标签
+            clean = re.sub(r'<[^>]+>', '|||', price_text)
+            clean = re.sub(r'\s+', ' ', clean)
+
+            # 查找液厂报价区块：企业名 + 出厂价 + 价格 + 日期
+            # 格式如: "星星能源|||出厂价|||5,950|||液化天然气|||内蒙古鄂尔多斯|||2026-06-04"
+            # 或: "内蒙森泰|||出厂价|||6,110|||液化天然气|||内蒙古森泰天然|||2026-06-04"
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+            # 按日期+价格模式匹配
+            segments = clean.split('|||')
+            i = 0
+            quotes = []
+            while i < len(segments) - 4:
+                seg = segments[i].strip()
+                # 找到包含"出厂价"的段
+                if '出厂价' in seg and i > 0:
+                    # 前一段是企业名
+                    name = segments[i - 1].strip()
+                    # 后面几段是: 出厂价, 价格, 规格, 产地, 日期
+                    price_seg = segments[i + 1].strip() if i + 1 < len(segments) else ""
+                    date_seg = segments[i + 4].strip() if i + 4 < len(segments) else ""
+
+                    if date_seg.startswith(today_str[:10]) or date_seg.startswith(yesterday_str[:10]):
+                        price_val = re.sub(r'[,\s]', '', price_seg)
+                        try:
+                            price_num = float(price_val)
+                            if 4000 < price_num < 10000:  # 合理范围校验
+                                # 识别省份
+                                prov_seg = segments[i + 3].strip() if i + 3 < len(segments) else ""
+                                province = ""
+                                for prov_name in ["内蒙古", "陕西", "山西", "宁夏", "四川", "新疆",
+                                                  "河北", "河南", "山东", "湖北", "贵州", "重庆",
+                                                  "甘肃", "青海", "黑龙江", "吉林", "辽宁"]:
+                                    if prov_name in prov_seg:
+                                        province = prov_name
+                                        break
+
+                                quotes.append({
+                                    "name": name,
+                                    "province": province or prov_seg,
+                                    "price": int(price_num),
+                                    "date": date_seg[:10],
+                                })
+                        except ValueError:
+                            pass
+                i += 1
+
+            # 去重（同名企业取最新日期）
+            seen = {}
+            for q in quotes:
+                key = q["name"]
+                if key not in seen or q["date"] > seen[key]["date"]:
+                    seen[key] = q
+            result["plant_quotes"] = list(seen.values())
+
+            if result["plant_quotes"]:
+                print(f"  生意社液厂报价: 抓取到{len(result['plant_quotes'])}家企业最新报价")
+    except Exception as e:
+        print(f"[WARN] 生意社报价页面抓取失败: {e}")
+
+    # 至少拿到了基准价或参考价才算成功
+    if not result["benchmark"] and not result["reference"]:
+        result["source"] = "failed"
+
+    return result
+
+
+def fetch_lng168_daily_from_web():
+    """
+    从搜索引擎找到LNG物联网每日市场报价文章（搜狐/百家号转载），
+    抓取液厂均价、接收站均价、开工率、涨跌厂数、竞拍数据、市场评述
+    返回: {
+        'domestic_avg': int,       # 液厂均价 元/吨
+        'terminal_avg': int,       # 接收站均价 元/吨
+        'domestic_high': int,
+        'domestic_low': int,
+        'terminal_high': int,
+        'terminal_high_name': str,
+        'terminal_low': int,
+        'terminal_low_name': str,
+        'operating_rate': int,     # 开工率%
+        'up_count': int,           # 调涨厂数
+        'down_count': int,         # 降价厂数
+        'auction_price': str,      # 竞拍价格
+        'auction_volume': str,     # 竞拍成交量
+        'market_comment': str,     # 市场评述
+        'article_date': str,
+        'source': 'lng168-web'
+    }
+    """
+    result = {
+        "domestic_avg": None, "terminal_avg": None,
+        "domestic_high": None, "domestic_low": None,
+        "terminal_high": None, "terminal_high_name": None,
+        "terminal_low": None, "terminal_low_name": None,
+        "operating_rate": None, "up_count": None, "down_count": None,
+        "auction_price": None, "auction_volume": None,
+        "market_comment": "", "article_date": "", "source": "lng168-web",
+    }
+
+    article_url = None
+
+    # 策略1: 用Google搜索搜狐上的LNG物联网文章
+    try:
+        import urllib.parse as _urlparse
+        today = datetime.now().strftime("%Y.%m.%d")
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y.%m.%d")
+        # 搜索当天或前一天的日期标记
+        search_q = _urlparse.quote(f'"LNG物联网" "市场整体报价" {today[5:]} OR {yesterday[5:]}')
+        google_url = f"https://www.google.com/search?q={search_q}&tbs=qdr:w&num=5"
+        search_text = http_get(google_url, timeout=15)
+        if search_text:
+            # 搜狐URL
+            found = re.findall(r'(https?://[^"\s]+sohu\.com/a/\d+_\d+)', search_text)
+            if not found:
+                found = re.findall(r'(https?://[^"\s]+baijiahao\.baidu\.com[^"\s]*)', search_text)
+            if found:
+                article_url = found[0]
+    except Exception:
+        pass
+
+    # 策略2: 用Bing搜索
+    if not article_url:
+        try:
+            import urllib.parse as _urlparse
+            search_q = _urlparse.quote('"LNG物联网" "市场整体报价分析" 2026')
+            bing_url = f"https://www.bing.com/search?q={search_q}&filters=ex1%3a%22ez1%22"
+            search_text = http_get(bing_url, timeout=15)
+            if search_text:
+                # 优先搜狐
+                found = re.findall(r'(https?://[^"\s]+sohu\.com/a/\d+_\d+)', search_text)
+                if not found:
+                    found = re.findall(r'(https?://[^"\s]+baijiahao\.baidu\.com[^"\s]*)', search_text)
+                if found:
+                    article_url = found[0]
+        except Exception:
+            pass
+
+    # 策略3: 直接从lng168.com搜索
+    if not article_url:
+        try:
+            search_url = "https://www.lng168.com/gateWay/newsList?keyword=LNG%E5%B8%82%E5%9C%BA%E6%95%B4%E4%BD%93%E6%8A%A5%E4%BB%B7"
+            search_text = http_get(search_url, timeout=10)
+            if search_text:
+                ids = list(dict.fromkeys(re.findall(r'newsDetail\?id=(\d+)', search_text)))
+                for aid in ids[:3]:
+                    test_url = f"https://www.lng168.com/gateWay/newsDetail?id={aid}"
+                    test_text = http_get(test_url, timeout=10)
+                    if test_text and "市场均价" in test_text:
+                        article_url = test_url
+                        break
+        except Exception:
+            pass
+
+    if not article_url:
+        print("[WARN] LNG物联网日报文章未找到")
+        result["source"] = "failed"
+        return result
+
+    # 抓取文章内容
+    article_text = http_get(article_url, timeout=15)
+    if not article_text:
+        result["source"] = "failed"
+        return result
+
+    # 清理HTML
+    clean = re.sub(r'<[^>]+>', ' ', article_text)
+    clean = re.sub(r'\s+', ' ', clean)
+
+    # 提取液厂均价
+    avg_match = re.search(r'市场均价为(\d+)\s*元', clean)
+    if avg_match:
+        result["domestic_avg"] = int(avg_match.group(1))
+
+    # 提取液厂最高/最低价
+    high_match = re.search(r'较高价报价(\d+)\s*元', clean)
+    if high_match:
+        result["domestic_high"] = int(high_match.group(1))
+    low_match = re.search(r'较低价报价(\d+)\s*元', clean)
+    if low_match:
+        result["domestic_low"] = int(low_match.group(1))
+
+    # 提取开工率
+    rate_match = re.search(r'开工率(\d+)%', clean)
+    if rate_match:
+        result["operating_rate"] = int(rate_match.group(1))
+
+    # 提取接收站均价
+    term_avg_match = re.search(r'接收站均价\s*为(\d+)\s*元', clean)
+    if term_avg_match:
+        result["terminal_avg"] = int(term_avg_match.group(1))
+
+    # 提取接收站最高/最低价
+    term_high_match = re.search(r'较\s*高价(?:是|为)\s*(.+?)\s*报价(\d+)\s*元', clean)
+    if term_high_match:
+        result["terminal_high_name"] = term_high_match.group(1).strip()
+        result["terminal_high"] = int(term_high_match.group(2))
+    term_low_match = re.search(r'较\s*低价(?:是|为)(.+?)\s*报价(\d+)\s*元', clean)
+    if term_low_match:
+        result["terminal_low_name"] = term_low_match.group(1).strip()
+        result["terminal_low"] = int(term_low_match.group(2))
+
+    # 提取涨跌厂数
+    up_match = re.search(r'(\d+)家\s*调?\s*涨', clean)
+    if up_match:
+        result["up_count"] = int(up_match.group(1))
+    down_match = re.search(r'(\d+)家\s*降\s*价', clean)
+    if down_match:
+        result["down_count"] = int(down_match.group(1))
+
+    # 提取竞拍数据
+    # 格式1: "原料气竞拍，成交价格为3.75-3.9元/方"
+    auction_match = re.search(r'原料气竞拍[，,]\s*成交价格为([\d.]+)\s*-\s*([\d.]+)\s*元/方', clean)
+    if auction_match:
+        result["auction_price"] = f"{auction_match.group(1)}-{auction_match.group(2)}元/方"
+    if not result["auction_price"]:
+        auction_match2 = re.search(r'起拍价格?([\d.]+)\s*元/方', clean)
+        if auction_match2:
+            result["auction_price"] = f"{auction_match2.group(1)}元/方"
+    # 成交量
+    auction_vol_match = re.search(r'成交量?为?(\d+)\s*万方', clean)
+    if auction_vol_match:
+        result["auction_volume"] = f"{auction_vol_match.group(1)}万方"
+    elif not result["auction_volume"]:
+        vol_match2 = re.search(r'投放量?(\d+)\s*万方', clean)
+        if vol_match2:
+            result["auction_volume"] = f"{vol_match2.group(1)}万方"
+
+    # 提取市场评述（取文章中关于行情描述的文字）
+    comment_parts = []
+    # 评述在数据段之后、"国际油价"之前
+    comment_markers = ['无流拍', '调涨', '降价', '涨幅']
+    comment_start = -1
+    for marker in comment_markers:
+        idx = clean.find(marker)
+        if idx > 0:
+            comment_start = idx
+            break
+    if comment_start > 0:
+        after = clean[comment_start:comment_start+800]
+        oil_idx = after.find('国际油价')
+        if oil_idx > 0:
+            comment_text = after[:oil_idx].strip().rstrip('。；')
+            if len(comment_text) > 20:
+                comment_parts.append(comment_text[:400])
+    # 海气评述
+    haiqi_match = re.search(r'海气方面[，,]\s*(.+?)(?:国际油价|$)', clean)
+    if haiqi_match:
+        comment_parts.append(f"海气：{haiqi_match.group(1).strip()[:200]}")
+
+    result["market_comment"] = "；".join(comment_parts) if comment_parts else ""
+
+    # 提取文章日期
+    date_match = re.search(r'2026\.(\d{1,2})\.(\d{1,2})', clean)
+    if date_match:
+        result["article_date"] = f"2026-{date_match.group(1).zfill(2)}-{date_match.group(2).zfill(2)}"
+
+    got_any = result["domestic_avg"] or result["terminal_avg"] or result["operating_rate"]
+    if got_any:
+        print(f"  LNG物联网日报({result['article_date']}): 液厂={result['domestic_avg']}, 接收站={result['terminal_avg']}, 开工率={result['operating_rate']}%")
+    else:
+        result["source"] = "failed"
+
+    return result
+
+
+def fetch_shpgx_daily():
+    """
+    从新浪财经抓取上海石油天然气交易中心(SHPGX)每日发布的交易数据及价格指数
+    数据源：新浪财经转载的SHPGX公告
+    返回: {
+        'lng_factory_price': int,       # 中国LNG出厂价格指数
+        'lng_terminal_price': int,      # 中国LNG出站价格指数
+        'pipeline_spot_price': float,   # 管道气现货价格 元/方
+        'pipeline_monthly_avg': float,  # 管道气现货月度均价 元/方
+        'cnooc_terminals': [{name, region, province, price}, ...],  # 中海油基准价
+        'trade_data': [{type, volume, price}, ...],                # 成交行情
+        'article_date': str,
+        'source': 'sina-shpgx'
+    }
+    """
+    result = {
+        "lng_factory_price": None, "lng_terminal_price": None,
+        "pipeline_spot_price": None, "pipeline_monthly_avg": None,
+        "cnooc_terminals": [], "trade_data": [],
+        "article_date": "", "source": "sina-shpgx",
+    }
+
+    article_url = None
+
+    # 策略1: Google搜索（限制最近一周）
+    try:
+        import urllib.parse as _urlparse
+        search_q = _urlparse.quote('site:finance.sina.com.cn "SHPGX交易及数据指数发布"')
+        google_url = f"https://www.google.com/search?q={search_q}&tbs=qdr:w&num=5"
+        search_text = http_get(google_url, timeout=15)
+        if search_text:
+            found = re.findall(r'(https?://finance\.sina\.com\.cn/[^"\s]+doc-[^"\s]+\.shtml)', search_text)
+            if found:
+                article_url = found[0]
+    except Exception:
+        pass
+
+    # 策略2: Bing搜索（限制最近一周）
+    if not article_url:
+        try:
+            import urllib.parse as _urlparse
+            search_q = _urlparse.quote('"SHPGX交易及数据指数发布" 2026')
+            bing_url = f"https://www.bing.com/search?q={search_q}&filters=ex1%3a%22ez1%22"
+            search_text = http_get(bing_url, timeout=15)
+            if search_text:
+                found = re.findall(r'(https?://finance\.sina\.com\.cn/[^"\s]+doc-[^"\s]+\.shtml)', search_text)
+                if found:
+                    # 选择URL中日期最新的（doc-iniacaet这类编码中无日期，取最后一条可能最新）
+                    article_url = found[-1]
+        except Exception:
+            pass
+
+    # 策略3: 直接在新浪财经搜索SHPGX文章
+    if not article_url:
+        try:
+            import urllib.parse as _urlparse
+            # 直接搜索新浪财经
+            search_q = _urlparse.quote('"SHPGX交易" OR "上海石油天然气交易中心" 价格指数 site:finance.sina.com.cn 2026')
+            bing_url = f"https://www.bing.com/search?q={search_q}&filters=ex1%3a%22ez1%22"
+            search_text = http_get(bing_url, timeout=15)
+            if search_text:
+                found = re.findall(r'(https?://finance\.sina\.com\.cn/[^"\s]+doc-[^"\s]+\.shtml)', search_text)
+                if found:
+                    article_url = found[-1]
+        except Exception:
+            pass
+
+    # 策略4: 搜狐转载的SHPGX文章
+    if not article_url:
+        try:
+            import urllib.parse as _urlparse
+            search_q = _urlparse.quote('"SHPGX交易及数据指数发布" 2026年6月')
+            bing_url = f"https://www.bing.com/search?q={search_q}"
+            search_text = http_get(bing_url, timeout=15)
+            if search_text:
+                # 新浪财经或搜狐
+                found = re.findall(r'(https?://(?:finance\.sina\.com\.cn|www\.sohu\.com)/[^"\s]+(?:doc-[^"\s]+|_\d+_\d+)[^"\s]*\.shtml)', search_text)
+                if not found:
+                    found = re.findall(r'(https?://finance\.sina\.com\.cn/[^"\s]+doc-[^"\s]+\.shtml)', search_text)
+                if not found:
+                    found = re.findall(r'(https?://[^"\s]+sina[^"\s]+\.shtml)', search_text)
+                if found:
+                    article_url = found[0]
+        except Exception:
+            pass
+
+    if not article_url:
+        print("[WARN] SHPGX日报文章未找到")
+        result["source"] = "failed"
+        return result
+
+    # 抓取文章
+    article_text = http_get(article_url, timeout=15)
+    if not article_text:
+        result["source"] = "failed"
+        return result
+
+    # 清理HTML
+    clean = re.sub(r'<[^>]+>', ' ', article_text)
+    clean = re.sub(r'\s+', ' ', clean)
+
+    # 提取价格指数
+    factory_match = re.search(r'中国LNG出厂价格\s*\d+月\d+日\s*(\d+)\s*元/吨', clean)
+    if factory_match:
+        result["lng_factory_price"] = int(factory_match.group(1))
+
+    terminal_match = re.search(r'中国LNG出站价格\s*\d+月\d+日\s*(\d+)\s*元/吨', clean)
+    if terminal_match:
+        result["lng_terminal_price"] = int(terminal_match.group(1))
+
+    pipe_spot_match = re.search(r'中国管道气现货价格[^0-9]*(\d+[\d.]*)\s*元/方', clean)
+    if pipe_spot_match:
+        result["pipeline_spot_price"] = float(pipe_spot_match.group(1))
+
+    pipe_avg_match = re.search(r'中国管道气现货月度均价[^0-9]*(\d+[\d.]*)\s*元/方', clean)
+    if pipe_avg_match:
+        result["pipeline_monthly_avg"] = float(pipe_avg_match.group(1))
+
+    # 提取中海油基准价
+    cnooc_section = re.search(r'中海油市场基准价格(.+?)(?:山西华新|数据来源|$)', clean, re.DOTALL)
+    if cnooc_section:
+        section_text = cnooc_section.group(1)
+
+        # 提取各接收站-省份-价格组合
+        # 格式如: "浙江宁波LNG接收站 浙江 6950"
+        cnooc_matches = re.findall(
+            r'([\u4e00-\u9fa5]+LNG接收站)\s+([\u4e00-\u9fa5]+[东西]?)\s+(\d{4})',
+            section_text
+        )
+        for terminal, province, price in cnooc_matches:
+            # 确定区域
+            region = "华东"
+            if province in ("广东", "广西", "福建", "海南"):
+                region = "华南"
+            elif province in ("北京", "天津", "河北", "山东", "山西", "陕西"):
+                region = "华北"
+
+            result["cnooc_terminals"].append({
+                "name": terminal,
+                "region": region,
+                "province": province,
+                "price": int(price),
+            })
+
+    # 去重（同名接收站+省份组合，取最后一条）
+    seen = {}
+    for t in result["cnooc_terminals"]:
+        key = f"{t['name']}|{t['province']}"
+        seen[key] = t
+    result["cnooc_terminals"] = list(seen.values())
+
+    # 提取成交行情
+    trade_matches = re.findall(r'([\u4e00-\u9fa5A-Za-z]+(?:竞价|挂牌|交易))\s*(\d+)\s*吨', clean)
+    for trade_type, volume in trade_matches:
+        result["trade_data"].append({
+            "type": trade_type,
+            "volume": int(volume),
+            "price": None,
+        })
+
+    # 提取文章日期
+    date_match = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日', clean)
+    if date_match:
+        result["article_date"] = f"{date_match.group(1)}-{date_match.group(2).zfill(2)}-{date_match.group(3).zfill(2)}"
+
+    got_any = result["lng_factory_price"] or result["lng_terminal_price"] or result["cnooc_terminals"]
+    # 校验日期是否为最近3天
+    if got_any and result["article_date"]:
+        try:
+            art_dt = datetime.strptime(result["article_date"], "%Y-%m-%d")
+            if (datetime.now() - art_dt).days > 3:
+                print(f"[WARN] SHPGX文章日期{result['article_date']}已超过3天，数据可能过时")
+                result["source"] = "sina-shpgx-stale"
+        except ValueError:
+            pass
+    elif not got_any:
+        result["source"] = "failed"
+
+    return result
+
+
 def fetch_lng_prices():
-    """采集国内LNG价格（自动从LNG物联网抓取，失败回退手动数据）"""
+    """采集国内LNG价格（多数据源自动采集，失败回退手动数据）
+
+    数据源优先级:
+    1. LNG物联网日报（搜狐/百家号转载）→ 最全面：液厂均价、接收站均价、开工率等
+    2. 生意社（100ppi）→ LNG基准价/参考价 + 液厂具体报价
+    3. lng168原始网站 → 备用
+    4. SHPGX日报（新浪财经）→ 价格指数 + 中海油基准价
+    5. Mysteel → 华东接收站实时价格
+    """
     data = {
         "domestic_avg": None, "terminal_avg": None,
         "domestic_high": None, "domestic_low": None,
@@ -485,6 +994,11 @@ def fetch_lng_prices():
         "terminal_high_name": None, "terminal_low_name": None,
         "operating_rate": None, "up_count": None, "down_count": None,
         "market_summary": "",
+        "benchmark": None, "reference": None, "ref_change_pct": None,  # 生意社数据
+        "plant_quotes": [],  # 生意社液厂报价
+        "auction_price": None, "auction_volume": None,  # 竞拍数据
+        "market_comment": "",  # 市场评述
+        "shpgx": {},  # SHPGX数据
         "source": "manual",
         # === 各码头接收站价格（元/吨，手动后备） ===
         "terminals": {
@@ -513,102 +1027,126 @@ def fetch_lng_prices():
         },
     }
     
-    # === 策略：从LNG物联网(lng168.com)搜索最新文章并提取价格 ===
-    try:
-        import re as _re
-        
-        # 第一步：搜索文章列表，找到最新文章ID
-        search_url = "https://www.lng168.com/gateWay/newsList?keyword=LNG%E5%B8%82%E5%9C%BA%E6%95%B4%E4%BD%93%E6%8A%A5%E4%BB%B7"
-        search_text = http_get(search_url, timeout=10)
-        article_ids = []
-        if search_text:
-            article_ids = list(dict.fromkeys(_re.findall(r'newsDetail\?id=(\d+)', search_text)))
-        
-        # 第二步：逐个检查文章，找到今天或最近一天的
-        for aid in article_ids[:5]:
-            article_url = f"https://www.lng168.com/gateWay/newsDetail?id={aid}"
-            article_text = http_get(article_url, timeout=10)
-            if not article_text:
-                continue
-            
-            # 检查日期是否是今天或最近
-            date_match = _re.search(r'2026\.(\d+)\.(\d+)', article_text)
-            if not date_match:
-                continue
-            
-            # 去除HTML标签提取纯文本
-            clean_text = _re.sub(r'<[^>]+>', ' ', article_text)
-            clean_text = _re.sub(r'\s+', ' ', clean_text)
-            
-            # 提取液厂均价（容忍空格：6009 元 /吨）
-            avg_match = _re.search(r'市场均价为(\d+)\s*元', clean_text)
-            if avg_match:
-                data["domestic_avg"] = int(avg_match.group(1))
-            
-            # 提取液厂最高/最低价
-            high_match = _re.search(r'较高价报价(\d+)\s*元', clean_text)
-            if high_match:
-                data["domestic_high"] = int(high_match.group(1))
-            low_match = _re.search(r'较低价报价(\d+)\s*元', clean_text)
-            if low_match:
-                data["domestic_low"] = int(low_match.group(1))
-            
-            # 提取开工率
-            rate_match = _re.search(r'开工率(\d+)%', clean_text)
-            if rate_match:
-                data["operating_rate"] = int(rate_match.group(1))
-            
-            # 提取接收站均价
-            term_avg_match = _re.search(r'接收站均价\s*为(\d+)\s*元', clean_text)
-            if term_avg_match:
-                data["terminal_avg"] = int(term_avg_match.group(1))
-            
-            # 提取接收站最高价站（"较 高价是"可能有空格）
-            term_high_match = _re.search(r'较\s*高价是\s*(.+?)\s*报价(\d+)\s*元', clean_text)
-            if term_high_match:
-                data["terminal_high_name"] = term_high_match.group(1).strip()
-                data["terminal_high"] = int(term_high_match.group(2))
-            
-            # 提取接收站最低价站
-            term_low_match = _re.search(r'较\s*低价是(.+?)\s*报价(\d+)\s*元', clean_text)
-            if term_low_match:
-                data["terminal_low_name"] = term_low_match.group(1).strip()
-                data["terminal_low"] = int(term_low_match.group(2))
-            
-            # 提取涨跌厂数
-            up_match = _re.search(r'(\d+)家\s*调\s*涨', clean_text)
-            if up_match:
-                data["up_count"] = int(up_match.group(1))
-            down_match = _re.search(r'(\d+)家\s*降\s*价', clean_text)
-            if down_match:
-                data["down_count"] = int(down_match.group(1))
-            
-            # 如果至少获取到了均价，就不再尝试其他文章
-            if data["domestic_avg"] or data["terminal_avg"]:
-                data["source"] = "lng168"
-                print(f"  LNG数据已从lng168更新: 液厂{data['domestic_avg']}元/吨, 接收站{data['terminal_avg']}元/吨")
-                break
-    
-    except Exception as e:
-        print(f"[WARN] lng168 LNG数据抓取失败: {e}")
-    
-    # === 集成 Mysteel 华东LNG接收站实时价格 ===
+    # === 数据源1: LNG物联网日报（搜狐/百家号转载）→ 最全面 ===
+    lng168_web = fetch_lng168_daily_from_web()
+    if lng168_web["source"] != "failed":
+        for key in ["domestic_avg", "terminal_avg", "domestic_high", "domestic_low",
+                     "terminal_high", "terminal_high_name", "terminal_low", "terminal_low_name",
+                     "operating_rate", "up_count", "down_count", "auction_price", "auction_volume",
+                     "market_comment"]:
+            if lng168_web.get(key) is not None:
+                data[key] = lng168_web[key]
+        data["source"] = "lng168-web"
+
+    # === 数据源2: 生意社（100ppi）→ LNG基准价/参考价 + 液厂报价 ===
+    pppi = fetch_from_100ppi()
+    if pppi["source"] != "failed":
+        # 生意社基准价/参考价补充（更可靠）
+        if pppi.get("benchmark") and not data.get("domestic_avg"):
+            data["domestic_avg"] = int(pppi["benchmark"])
+        if pppi.get("reference"):
+            data["reference"] = pppi["reference"]
+            data["ref_change_pct"] = pppi.get("ref_change_pct")
+        if pppi.get("benchmark"):
+            data["benchmark"] = pppi["benchmark"]
+        if pppi.get("plant_quotes"):
+            data["plant_quotes"] = pppi["plant_quotes"]
+        if data["source"] == "manual":
+            data["source"] = "100ppi"
+        elif data["source"] == "lng168-web":
+            data["source"] = "lng168-web+100ppi"
+
+    # === 数据源3: lng168原始网站（备用，补缺） ===
+    if not data["domestic_avg"] and not data["terminal_avg"]:
+        try:
+            search_url = "https://www.lng168.com/gateWay/newsList?keyword=LNG%E5%B8%82%E5%9C%BA%E6%95%B4%E4%BD%93%E6%8A%A5%E4%BB%B7"
+            search_text = http_get(search_url, timeout=10)
+            article_ids = list(dict.fromkeys(re.findall(r'newsDetail\?id=(\d+)', search_text or "")))
+
+            for aid in article_ids[:5]:
+                article_url = f"https://www.lng168.com/gateWay/newsDetail?id={aid}"
+                article_text = http_get(article_url, timeout=10)
+                if not article_text:
+                    continue
+                clean_text = re.sub(r'<[^>]+>', ' ', article_text)
+                clean_text = re.sub(r'\s+', ' ', clean_text)
+
+                avg_match = re.search(r'市场均价为(\d+)\s*元', clean_text)
+                if avg_match:
+                    data["domestic_avg"] = int(avg_match.group(1))
+                high_match = re.search(r'较高价报价(\d+)\s*元', clean_text)
+                if high_match:
+                    data["domestic_high"] = int(high_match.group(1))
+                low_match = re.search(r'较低价报价(\d+)\s*元', clean_text)
+                if low_match:
+                    data["domestic_low"] = int(low_match.group(1))
+                rate_match = re.search(r'开工率(\d+)%', clean_text)
+                if rate_match:
+                    data["operating_rate"] = int(rate_match.group(1))
+                term_avg_match = re.search(r'接收站均价\s*为(\d+)\s*元', clean_text)
+                if term_avg_match:
+                    data["terminal_avg"] = int(term_avg_match.group(1))
+                term_high_match = re.search(r'较\s*高价是\s*(.+?)\s*报价(\d+)\s*元', clean_text)
+                if term_high_match:
+                    data["terminal_high_name"] = term_high_match.group(1).strip()
+                    data["terminal_high"] = int(term_high_match.group(2))
+                term_low_match = re.search(r'较\s*低价是(.+?)\s*报价(\d+)\s*元', clean_text)
+                if term_low_match:
+                    data["terminal_low_name"] = term_low_match.group(1).strip()
+                    data["terminal_low"] = int(term_low_match.group(2))
+                up_match = re.search(r'(\d+)家\s*调\s*涨', clean_text)
+                if up_match:
+                    data["up_count"] = int(up_match.group(1))
+                down_match = re.search(r'(\d+)家\s*降\s*价', clean_text)
+                if down_match:
+                    data["down_count"] = int(down_match.group(1))
+
+                if data["domestic_avg"] or data["terminal_avg"]:
+                    data["source"] = "lng168"
+                    print(f"  LNG数据已从lng168更新: 液厂{data['domestic_avg']}元/吨, 接收站{data['terminal_avg']}元/吨")
+                    break
+        except Exception as e:
+            print(f"[WARN] lng168 LNG数据抓取失败: {e}")
+
+    # === 数据源4: SHPGX日报（新浪财经）→ 价格指数 + 中海油基准价 ===
+    shpgx_data = fetch_shpgx_daily()
+    data["shpgx"] = shpgx_data
+    # 只使用非过时的SHPGX数据
+    shpgx_is_stale = shpgx_data.get("source", "").endswith("stale")
+    if not shpgx_is_stale:
+        # 用SHPGX的价格指数补缺
+        if shpgx_data.get("lng_factory_price") and not data.get("domestic_avg"):
+            data["domestic_avg"] = shpgx_data["lng_factory_price"]
+        if shpgx_data.get("lng_terminal_price") and not data.get("terminal_avg"):
+            data["terminal_avg"] = shpgx_data["lng_terminal_price"]
+        # 用中海油基准价更新接收站价格（覆盖手动后备值）
+        if shpgx_data.get("cnooc_terminals"):
+            _update_terminals_from_cnooc(data["terminals"], shpgx_data["cnooc_terminals"])
+            if data["source"] == "manual":
+                data["source"] = "shpgx"
+            else:
+                data["source"] = data["source"].replace("manual", "shpgx")
+    else:
+        print(f"[INFO] SHPGX数据已过时({shpgx_data.get('article_date')})，跳过使用")
+
+    # === 数据源5: Mysteel 华东LNG接收站实时价格（最精确的华东数据） ===
     try:
         mysteel_terminals = fetch_mysteel_lng_terminals()
         if mysteel_terminals:
-            # 更新华东地区终端价格
             terminals = data.get("terminals", {})
             for mt in mysteel_terminals:
                 region = mt.get("region", "华东")
                 if region not in terminals:
                     terminals[region] = []
-                # 在已有列表中找同名终端更新
                 found = False
                 for existing in terminals.get(region, []):
                     if mt["name"] in existing["name"] or existing["name"] in mt["name"]:
-                        existing["price"] = mt["price"]
-                        existing["change"] = mt["change"]
-                        existing["note"] = f"Mysteel实时数据"
+                        # Mysteel数据优先（更精确），但中海油基准价也是好数据
+                        # 如果已有中海油数据则保留，Mysteel只在没有时覆盖
+                        if existing.get("note", "") != "SHPGX中海油基准价":
+                            existing["price"] = mt["price"]
+                            existing["change"] = mt["change"]
+                            existing["note"] = f"Mysteel实时数据"
                         found = True
                         break
                 if not found:
@@ -622,16 +1160,95 @@ def fetch_lng_prices():
                     })
             data["terminals"] = terminals
             if data["source"] == "manual":
-                data["source"] = "mysteel+lng168"
+                data["source"] = "mysteel"
     except Exception as e:
         print(f"[WARN] Mysteel终端数据集成失败: {e}")
-    
+
     return data
 
-def fetch_pipeline_gas_prices():
-    """管道天然气门站价格（月度更新）"""
-    # 门站价为月度/季度发布，非日频数据
-    # 来源：各省发改委 + 我的钢铁网/隆众资讯汇总
+
+def _update_terminals_from_cnooc(terminals_dict, cnooc_list):
+    """用SHPGX中海油基准价更新接收站价格表"""
+    # 中海油接收站名称映射
+    cnooc_name_map = {
+        "浙江宁波LNG接收站": ("宁波北仑", "中海油"),
+        "江苏滨海LNG接收站": ("滨海", "中海油"),
+        "珠海LNG接收站": ("珠海金湾", "中海油"),
+        "粤东接收站": ("粤东惠来", "国家管网"),
+        "国网天津LNG接收站": ("天津浮式", "中海油"),
+        "北燃南港LNG接收站": ("天津南港", "中石化"),
+    }
+
+    # 按接收站+省份聚合价格
+    cnooc_by_name = {}
+    for c in cnooc_list:
+        key = c["name"]
+        if key not in cnooc_by_name:
+            cnooc_by_name[key] = []
+        cnooc_by_name[key].append(c)
+
+    for cnooc_name, entries in cnooc_by_name.items():
+        mapped = cnooc_name_map.get(cnooc_name)
+        if not mapped:
+            continue
+        short_name, company = mapped
+
+        # 找到对应region中的接收站
+        for region, stations in terminals_dict.items():
+            for s in stations:
+                if short_name in s["name"] or s["name"] in short_name:
+                    # 如果有多个省份不同价格，合并显示
+                    prices = [e["price"] for e in entries if e.get("price")]
+                    if len(prices) == 0:
+                        continue
+                    elif len(prices) == 1:
+                        s["price"] = prices[0]
+                    else:
+                        price_min, price_max = min(prices), max(prices)
+                        if price_min == price_max:
+                            s["price"] = price_min
+                        else:
+                            s["price"] = f"{price_min}~{price_max}"
+                    s["note"] = "SHPGX中海油基准价"
+                    break
+
+    # 添加珠海金湾（如果不在已有列表中）
+    has_zhuhai = any("珠海" in s["name"] for region_stations in terminals_dict.values() for s in region_stations)
+    if not has_zhuhai:
+        zhuhai_entries = cnooc_by_name.get("珠海LNG接收站", [])
+        if zhuhai_entries:
+            prices = [e["price"] for e in zhuhai_entries if e.get("price")]
+            if prices:
+                terminals_dict.setdefault("华南", []).append({
+                    "name": "珠海金湾",
+                    "company": "中海油",
+                    "province": "广东",
+                    "price": f"{min(prices)}~{max(prices)}" if min(prices) != max(prices) else prices[0],
+                    "change": 0,
+                    "note": "SHPGX中海油基准价",
+                })
+
+    # 添加粤东惠来
+    has_yuedong = any("粤东" in s["name"] for region_stations in terminals_dict.values() for s in region_stations)
+    if not has_yuedong:
+        yuedong_entries = cnooc_by_name.get("粤东接收站", [])
+        if yuedong_entries:
+            prices = [e["price"] for e in yuedong_entries if e.get("price")]
+            if prices:
+                terminals_dict.setdefault("华南", []).append({
+                    "name": "粤东惠来",
+                    "company": "国家管网",
+                    "province": "广东",
+                    "price": prices[0],
+                    "change": 0,
+                    "note": "SHPGX中海油基准价",
+                })
+
+def fetch_pipeline_gas_prices(shpgx_data=None):
+    """管道天然气门站价格及交易数据
+    新增：从SHPGX日报获取实时价格指数和成交数据
+    门站价为月度/季度发布，非日频数据
+    """
     data = {
         "provinces": {
             "北京": {"base": 1860, "regulated": 2204, "unregulated": 3162, "peak": 4805},
@@ -644,7 +1261,25 @@ def fetch_pipeline_gas_prices():
         "unit": "元/千立方米",
         "update_date": "2026-05-25",
         "source": "我的钢铁网/隆众资讯/各省发改委",
+        # === SHPGX实时数据 ===
+        "shpgx_lng_factory": None,    # LNG出厂价格指数（日频）
+        "shpgx_lng_terminal": None,   # LNG出站价格指数（日频）
+        "shpgx_pipe_spot": None,      # 管道气现货价格（月频）
+        "shpgx_pipe_monthly": None,   # 管道气现货月度均价（月频）
+        "shpgx_trade_data": [],       # 成交行情
+        "shpgx_date": "",             # 数据日期
     }
+
+    # 填充SHPGX实时数据（跳过过时数据）
+    if shpgx_data and shpgx_data.get("source") not in ("failed",) and not shpgx_data.get("source", "").endswith("stale"):
+        data["shpgx_lng_factory"] = shpgx_data.get("lng_factory_price")
+        data["shpgx_lng_terminal"] = shpgx_data.get("lng_terminal_price")
+        data["shpgx_pipe_spot"] = shpgx_data.get("pipeline_spot_price")
+        data["shpgx_pipe_monthly"] = shpgx_data.get("pipeline_monthly_avg")
+        data["shpgx_trade_data"] = shpgx_data.get("trade_data", [])
+        data["shpgx_date"] = shpgx_data.get("article_date", "")
+        data["source"] = f"我的钢铁网/隆众资讯/各省发改委 + SHPGX({shpgx_data.get('article_date', '')})"
+
     return data
 
 def fetch_jkm_price():
@@ -888,6 +1523,200 @@ def generate_terminal_tables(lng_data):
     return "".join(html_parts)
 
 
+def _lng_auction_row(lng_data):
+    """竞拍数据行"""
+    price = lng_data.get("auction_price")
+    volume = lng_data.get("auction_volume")
+    if price:
+        return f'<tr><td><strong>原料气竞拍</strong></td><td>{price}</td><td>—</td><td>—</td><td>{volume or "中石油直供"}</td><td>元/方</td></tr>'
+    return '<tr><td><strong>原料气竞拍</strong></td><td colspan="5" style="color:#999;">暂无当日竞拍数据</td></tr>'
+
+
+def _build_benchmark_section(lng_data):
+    """构建生意社基准价/参考价展示区"""
+    benchmark = lng_data.get("benchmark")
+    reference = lng_data.get("reference")
+    ref_change = lng_data.get("ref_change_pct")
+
+    if not benchmark and not reference:
+        return ""
+
+    parts = []
+    if benchmark:
+        parts.append(f'<span style="font-weight:700;color:#2c3e50;">基准价 {int(benchmark):,} 元/吨</span>')
+    if reference:
+        change_str = f" ({ref_change:+.2f}%)" if ref_change is not None else ""
+        parts.append(f'<span style="font-weight:700;color:#2980b9;">参考价 {int(reference):,} 元/吨{change_str}</span>')
+
+    return f"""
+    <div style="margin-top:10px;padding:10px 16px;background:#eaf2f8;border:1px solid #aed6f1;border-radius:8px;font-size:13px;">
+      📊 <strong>生意社数据：</strong>{" | ".join(parts)} | 数据来源：<a href="https://trq.100ppi.com/" style="color:#2980b9;">生意社</a>
+    </div>"""
+
+
+def _build_plant_quotes_section(lng_data):
+    """构建液厂出厂报价表"""
+    quotes = lng_data.get("plant_quotes", [])
+    if not quotes:
+        return ""
+
+    rows = ""
+    for q in quotes[:15]:  # 最多展示15家
+        price = q.get("price", "—")
+        if isinstance(price, (int, float)):
+            price_str = f"{int(price):,}"
+        else:
+            price_str = str(price)
+        rows += f"""
+        <tr><td>{q.get('name', '—')}</td><td>{q.get('province', '—')}</td><td style="font-weight:700;">{price_str}</td><td>{q.get('date', '—')}</td></tr>"""
+
+    return f"""
+    <div style="margin-top:12px;">
+      <h5 style="font-size:13px;color:#555;margin-bottom:6px;">🏭 主要液厂出厂报价（生意社）</h5>
+      <table>
+        <thead><tr><th>企业</th><th>省份</th><th>出厂价（元/吨）</th><th>日期</th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+      <div style="font-size:11px;color:#999;margin-top:4px;">数据来源：<a href="https://trq.100ppi.com/bj/index.html" style="color:#2980b9;">生意社-液化天然气报价</a> | 仅展示部分企业，完整报价见源网站</div>
+    </div>"""
+
+
+def _build_market_comment_section(lng_data):
+    """构建市场评述HTML"""
+    comment = lng_data.get("market_comment", "")
+    if not comment:
+        return ""
+    parts = comment.split("；")
+    items = "".join(f'<div style="margin:4px 0;">• {p.strip()}</div>' for p in parts if p.strip())
+    return f"""
+    <div style="margin-bottom:10px;padding:10px 14px;background:#fffde7;border:1px solid #f9e79f;border-radius:6px;font-size:13px;color:#7d6608;">
+      <strong>📝 LNG物联网市场评述：</strong>{items}
+    </div>"""
+
+
+def _build_shpgx_section(pipe_data, report_date):
+    """构建SHPGX交易数据HTML区块（动态数据）"""
+    shpgx_date = pipe_data.get("shpgx_date", "")
+    date_label = f"（{shpgx_date}）" if shpgx_date else f"（{report_date}）"
+
+    # 成交行情
+    trade_data = pipe_data.get("shpgx_trade_data", [])
+    trade_rows = ""
+    if trade_data:
+        for t in trade_data:
+            trade_rows += f"""
+          <tr><td>{t.get('type', '—')}</td><td style="font-weight:700;">{t.get('volume', '—'):,} 吨</td><td>—</td><td></td></tr>"""
+    else:
+        trade_rows = '<tr><td colspan="4" style="text-align:center;color:#999;">暂无当日成交数据</td></tr>'
+
+    # 价格指数
+    lng_factory = pipe_data.get("shpgx_lng_factory")
+    lng_terminal = pipe_data.get("shpgx_lng_terminal")
+    pipe_spot = pipe_data.get("shpgx_pipe_spot")
+    pipe_monthly = pipe_data.get("shpgx_pipe_monthly_avg")
+
+    index_rows = ""
+    if lng_factory:
+        index_rows += f"""
+            <tr><td>中国LNG出厂价格</td><td style="font-weight:700;">{lng_factory:,}</td><td>—</td><td>—</td><td>元/吨</td></tr>"""
+    if lng_terminal:
+        index_rows += f"""
+            <tr><td>中国LNG出站价格</td><td style="font-weight:700;">{lng_terminal:,}</td><td>—</td><td>—</td><td>元/吨</td></tr>"""
+    if pipe_spot:
+        index_rows += f"""
+            <tr style="background:#fffbf5;"><td><strong>🔥 管道气现货价格</strong></td><td style="font-weight:700;color:#e74c3c;">{pipe_spot}</td><td>—</td><td>—</td><td>元/立方米</td></tr>"""
+    if pipe_monthly:
+        index_rows += f"""
+            <tr><td>管道气现货月度均价</td><td style="font-weight:700;">{pipe_monthly}</td><td>—</td><td>—</td><td>元/立方米</td></tr>"""
+
+    if not index_rows:
+        index_rows = '<tr><td colspan="5" style="text-align:center;color:#999;">暂无当日价格指数</td></tr>'
+
+    has_real_data = bool(lng_factory or lng_terminal or pipe_spot or trade_data)
+    source_badge = '<span class="tag tag-blue">实时数据</span>' if has_real_data else '<span class="tag" style="background:#ffc107;color:#856404;">参考数据</span>'
+
+    return f"""
+    <div style="margin-bottom:12px;padding:8px 12px;background:#e8f4fd;border:1px solid #2980b9;border-radius:6px;font-size:13px;color:#1a5276;">
+      📡 本节数据来自新浪财经转载的SHPGX每日公告，{source_badge}，数据日期{date_label}
+    </div>
+    <div style="margin-bottom:18px;">
+      <h4 style="font-size:14px;color:#2980b9;margin-bottom:8px;">🏛 上海石油天然气交易中心（SHPGX）{date_label}</h4>
+      <table>
+        <thead><tr><th>交易品种</th><th>成交量</th><th>成交均价</th><th>备注</th></tr></thead>
+        <tbody>{trade_rows}</tbody>
+      </table>
+      <div style="margin-top:12px;">
+        <h5 style="font-size:13px;color:#555;margin-bottom:6px;">📊 SHPGX 价格指数</h5>
+        <table>
+          <thead><tr><th>指数名称</th><th>最新值</th><th>上期</th><th>变动</th><th>单位</th></tr></thead>
+          <tbody>{index_rows}</tbody>
+        </table>
+      </div>
+    </div>"""
+
+
+def _build_auction_section(lng_data):
+    """构建竞拍数据HTML区块"""
+    auction_price = lng_data.get("auction_price")
+    auction_volume = lng_data.get("auction_volume")
+    market_comment = lng_data.get("market_comment", "")
+
+    # 竞拍数据行
+    auction_rows = ""
+    if auction_price:
+        auction_rows += f"""
+          <tr style="background:#fffbf5;">
+            <td><strong>🔥 原料气竞拍</strong></td><td>最新</td><td style="font-weight:700;color:#e74c3c;">{auction_price}</td><td>{auction_volume or '—'}</td><td>全部成交</td></tr>"""
+    else:
+        auction_rows = '<tr><td colspan="5" style="text-align:center;color:#999;">暂无当日竞拍数据（可能非竞拍日）</td></tr>'
+
+    # 市场评述
+    comment_html = ""
+    if market_comment:
+        # 按分号分割，每段一行
+        parts = market_comment.split("；")
+        comment_items = "".join(f"<div>• {p.strip()}</div>" for p in parts if p.strip())
+        comment_html = f"""
+      <div style="margin-top:10px;padding:10px 14px;background:#fffde7;border:1px solid #f9e79f;border-radius:6px;font-size:12px;color:#7d6608;">
+        <strong>📝 LNG物联网市场评述：</strong>{comment_items}
+      </div>"""
+
+    return f"""
+    <div style="margin-bottom:18px;">
+      <h4 style="font-size:14px;color:#e67e22;margin-bottom:8px;">🏛 原料气竞拍 & LNG物联网市场评述</h4>
+      <table>
+        <thead><tr><th>竞拍品种</th><th>日期</th><th>成交价</th><th>成交量</th><th>备注</th></tr></thead>
+        <tbody>{auction_rows}</tbody>
+      </table>
+      {comment_html}
+    </div>"""
+
+
+def _pipe_spot_str(pipe_data):
+    """管道气现货价格文本"""
+    spot = pipe_data.get("shpgx_pipe_spot")
+    if spot:
+        return f"<strong>{spot}元/方</strong>"
+    return "约4.39元/方（参考值）"
+
+
+def _pipe_vs_gate_ratio(pipe_data):
+    """管道气现货价 vs 门站价倍数"""
+    spot = pipe_data.get("shpgx_pipe_spot")
+    if spot:
+        ratio = spot / 2.2
+        return f"{ratio:.1f}倍"
+    return "两倍"
+
+
+def _auction_insight(lng_data):
+    """竞拍数据洞察"""
+    auction_price = lng_data.get("auction_price")
+    if auction_price:
+        return f"最新原料气竞拍成交价{auction_price}，{lng_data.get('auction_volume', '')}，反映上游气源成本持续高企。"
+    return "延长石油靖边等竞拍数据需关注各交易中心公告获取最新信息。"
+
+
 def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pipe_data, news_data, insights_data=None, ttf_data=None, fx_data=None):
     """生成完整的HTML日报"""
     
@@ -1016,7 +1845,7 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
 <div class="header">
   <h1>⚡ 能源市场日报</h1>
   <div class="subtitle">城市燃气 · 市场决策参考</div>
-  <div class="date">📅 {report_date} | 数据截至 08:00 CST <span class="data-source">油:{oil_source} | 气:{hh_source} | TTF:{ttf_source} | JKM:{jkm_source} | 汇率:{fx_source} | LNG:{lng_source}</span></div>
+  <div class="date">📅 {report_date} | 数据截至 08:00 CST <span class="data-source">油:{oil_source} | 气:{hh_source} | TTF:{ttf_source} | JKM:{jkm_source} | 汇率:{fx_source} | LNG:{lng_source} | 管道气:{pipe_data.get('source', 'manual')[:30]}</span></div>
 </div>
 <div class="container">
   <div class="alert-banner">
@@ -1079,11 +1908,14 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
       <tbody>
         <tr><td><strong>国产液厂</strong> (133家)</td><td>{lng_domestic:,}</td><td>{lng_dom_high:,}</td><td>{lng_dom_low:,}</td><td>开工率{lng_op_rate}%，{lng_change_note}</td><td>元/吨</td></tr>
         <tr><td><strong>接收站均价</strong> (19家)</td><td>{lng_terminal:,}</td><td>{lng_term_high:,}（{lng_term_high_name}）</td><td>{lng_term_low:,}（{lng_term_low_name}）</td><td>进口成本高企</td><td>元/吨</td></tr>
-        <tr><td><strong>原料气竞拍</strong> (5月下半月)</td><td>3.65-3.95</td><td>—</td><td>—</td><td>中石油直供</td><td>元/方</td></tr>
+        {_lng_auction_row(lng_data)}
       </tbody>
     </table>
+    {_build_benchmark_section(lng_data)}
+    {_build_plant_quotes_section(lng_data)}
     <div style="margin-top:14px;padding:16px 20px;background:#f5fff5;border:1px solid #b8d4be;border-radius:10px;">
       <div style="font-size:15px;font-weight:700;color:#27ae60;margin-bottom:10px;">🔍 国内LNG市场洞察</div>
+      {_build_market_comment_section(lng_data)}
       <div style="font-size:14px;font-weight:600;color:#1e8449;margin-bottom:8px;">{lng_insight.get('headline', '国产液价低位盘整，接收站价格坚挺')}</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
         {"".join(f'<div style="background:#fff;padding:10px 14px;border-radius:6px;border-left:3px solid #27ae60;font-size:13px;"><strong>{d[0]}</strong><br><span style="color:#555;">{d[1]}</span></div>' for d in lng_insight.get('drivers', []))}
@@ -1108,48 +1940,12 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
 
   <section>
     <div class="section-title">📡 四、管道天然气交易市场动态</div>
-    <div style="margin-bottom:12px;padding:8px 12px;background:#fff3cd;border:1px solid #ffc107;border-radius:6px;font-size:13px;color:#856404;">⚠️ 本节数据为行业参考信息，非每日自动更新。SHPGX/重庆交易中心数据需登录查询，建议直接访问 <a href="https://www.shpgx.com" style="color:#0056b3;">shpgx.com</a> 获取最新数据。</div>
-    
-    <div style="margin-bottom:18px;">
-      <h4 style="font-size:14px;color:#2980b9;margin-bottom:8px;">🏛 上海石油天然气交易中心（SHPGX）| {report_date}</h4>
-      <table>
-        <thead><tr><th>交易品种</th><th>成交量</th><th>成交均价</th><th>备注</th></tr></thead>
-        <tbody>
-          <tr><td><strong>管道气挂牌交易</strong></td><td style="font-weight:700;">6,076 万方</td><td>—</td><td>当日活跃度较高</td></tr>
-          <tr><td>中石油液体竞价</td><td>880 吨</td><td>—</td><td></td></tr>
-          <tr><td>LNG挂牌交易</td><td>6,000 吨</td><td>—</td><td></td></tr>
-        </tbody>
-      </table>
-      <div style="margin-top:12px;">
-        <h5 style="font-size:13px;color:#555;margin-bottom:6px;">📊 SHPGX 价格指数</h5>
-        <table>
-          <thead><tr><th>指数名称</th><th>最新值</th><th>上期</th><th>变动</th><th>单位</th></tr></thead>
-          <tbody>
-            <tr><td>中国LNG出厂价格</td><td style="font-weight:700;">6,156</td><td>6,180</td><td><span class="tag tag-green">-24</span></td><td>元/吨</td></tr>
-            <tr><td>中国LNG出站价格</td><td style="font-weight:700;">6,207</td><td>6,217</td><td><span class="tag tag-green">-10</span></td><td>元/吨</td></tr>
-            <tr style="background:#fffbf5;"><td><strong>🔥 管道气现货价格（5月）</strong></td><td style="font-weight:700;color:#e74c3c;">4.39</td><td>3.62 (4月)</td><td><span class="tag tag-red">+21.3%</span></td><td>元/立方米</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-
-    <div style="margin-bottom:18px;">
-      <h4 style="font-size:14px;color:#e67e22;margin-bottom:8px;">🏛 重庆石油天然气交易中心 & 延长石油竞拍</h4>
-      <table>
-        <thead><tr><th>竞拍品种</th><th>日期</th><th>成交价</th><th>环比</th><th>成交量</th><th>备注</th></tr></thead>
-        <tbody>
-          <tr style="background:#fffbf5;">
-            <td><strong>🔥 延长石油管道气</strong>（靖边）</td><td>5月22日</td><td style="font-weight:700;color:#e74c3c;">3.71-3.75 元/方</td><td><span class="tag tag-red">+0.33~0.37</span></td><td>14,400万方</td><td>6月交收，全部成交</td></tr>
-          <tr><td>SHPGX管道气竞价</td><td>5月22日</td><td style="font-weight:700;">3.351 元/方</td><td>—</td><td>1,800万方</td><td>双边统计</td></tr>
-          <tr><td>重庆-广西管道气</td><td>5月25日</td><td>待公布</td><td>—</td><td>—</td><td>合同外气量</td></tr>
-        </tbody>
-      </table>
-    </div>
-
+    {_build_shpgx_section(pipe_data, report_date)}
+    {_build_auction_section(lng_data)}
     <div style="padding:14px 18px;background:#f4faf7;border:1px solid #b8d4be;border-radius:8px;font-size:13px;">
       <strong>📌 管道气市场洞察：</strong><br>
-      ① 管道气现货4.39元/方，是管制气门站价（~2.2元/方）的<strong>两倍</strong>。充分落实年度合同量是控成本的核心。<br>
-      ② 延长石油靖边6月竞拍3.71-3.75元/方，环比涨超10%，2月以来累计涨幅超75%，西北气源外输需求旺盛。
+      ① 管道气现货{_pipe_spot_str(pipe_data)}，是管制气门站价（~2.2元/方）的<strong>{_pipe_vs_gate_ratio(pipe_data)}</strong>。充分落实年度合同量是控成本的核心。<br>
+      ② {_auction_insight(lng_data)}
     </div>
   </section>
 
@@ -1205,7 +2001,7 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
 
 </div>
 <div class="footer">
-  <p>本报告由能源市场日报自动生成系统产出 | 数据来源：ICE、NYMEX、Yahoo Finance、EIA、ICE ENDEX、S&P Global Platts、我的钢铁网、LNG物联网、隆众资讯、各省发改委</p>
+  <p>本报告由能源市场日报自动生成系统产出 | 数据来源：ICE、NYMEX、Yahoo Finance、EIA、ICE ENDEX、S&P Global Platts、我的钢铁网、LNG物联网、生意社(100ppi)、新浪财经SHPGX、隆众资讯、各省发改委</p>
   <p>声明：本报告仅供内部决策参考，不构成投资建议 | 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')} CST</p>
 </div>
 </body>
@@ -1402,9 +2198,18 @@ def main():
     
     lng_data = fetch_lng_prices()
     print(f"  国内LNG: 国产={lng_data.get('domestic_avg')}, 接收站={lng_data.get('terminal_avg')} (来源: {lng_data['source']})")
+    if lng_data.get("benchmark"):
+        print(f"  生意社LNG基准价: {lng_data['benchmark']} 参考价: {lng_data.get('reference')} ({lng_data.get('ref_change_pct', 0):+.2f}%)")
+    if lng_data.get("market_comment"):
+        print(f"  市场评述: {lng_data['market_comment'][:60]}...")
     
-    pipe_data = fetch_pipeline_gas_prices()
-    print(f"  管道气门站价: 已加载{len(pipe_data.get('provinces', {}))}省份数据")
+    # 传递SHPGX数据给管道气函数
+    shpgx_data = lng_data.get("shpgx", {})
+    pipe_data = fetch_pipeline_gas_prices(shpgx_data)
+    shpgx_note = ""
+    if shpgx_data.get("lng_factory_price") and not shpgx_data.get("source", "").endswith("stale"):
+        shpgx_note = f" + SHPGX指数(LNG出厂={shpgx_data['lng_factory_price']}, 出站={shpgx_data.get('lng_terminal_price', '—')})"
+    print(f"  管道气门站价: 已加载{len(pipe_data.get('provinces', {}))}省份数据{shpgx_note}")
     
     news_data = fetch_geopolitical_news()
     print(f"  地缘新闻: 已采集{len(news_data)}条")

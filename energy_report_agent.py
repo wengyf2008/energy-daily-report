@@ -1433,7 +1433,7 @@ def fetch_market_insights(oil_data=None, hh_data=None, ttf_data=None, jkm_data=N
         "oil": {
             "headline": oil_headline,
             "drivers": [
-                (f"📊 布伦特{brent:.2f}美元({brent_chg:+.1f}%)", f"WTI报{wti:.2f}美元({(oil_data or {}).get('wti_change', 0):+.1f}%)，价差{wti-brent:.2f}美元。油价日内{oil_dir}，反映当前市场对供需和地缘风险的定价。"),
+                (f"📊 布伦特{brent:.2f}美元({brent_chg:+.1f}%)", f"WTI报{wti:.2f}美元({((oil_data or {}).get('wti_change') or 0):+.1f}%)，价差{wti-brent:.2f}美元。油价日内{oil_dir}，反映当前市场对供需和地缘风险的定价。"),
                 ("🇺🇸🇮🇷 中东局势", "美伊冲突持续影响霍尔木兹海峡航运安全，市场对原油供应中断保持警惕。冲突走向仍是油价短期最大变量。"),
                 ("🛢️ OPEC+供应", "沙特等国表态将在必要时释放剩余产能，但实际补偿能力存疑。OPEC+下次会议将讨论产量调整。"),
                 ("📉 需求前景", "中国炼厂开工回升支撑需求预期，但全球经济增长放缓限制油价上方空间。EIA库存变化需持续关注。"),

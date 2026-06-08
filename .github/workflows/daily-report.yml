@@ -42,8 +42,6 @@ jobs:
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
         run: |
           set -x
-          # 优先推企业微信，失败则降级到邮件
-          python3 energy_report_agent.py --push wecom 2>&1 | tee reports/run.log || \
           python3 energy_report_agent.py --push email 2>&1 | tee reports/run.log || true
           echo "✅ 日报生成并推送完成"
 

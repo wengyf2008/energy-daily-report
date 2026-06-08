@@ -175,36 +175,63 @@ def fetch_from_exchangerate():
 def fetch_oil_prices():
     """
     采集国际油价
-    数据源优先级: Stooq(主力) -> 东方财富(备用)
+    数据源优先级: Yahoo Finance(主力) -> Stooq(备用) -> 东方财富(备用2)
     """
     data = {"brent": None, "wti": None, "brent_change": None, "wti_change": None,
             "brent_high": None, "brent_low": None, "wti_high": None, "wti_low": None,
             "source": "manual"}
 
-    # 主力数据源: Stooq
+    # 主力数据源: Yahoo Finance（Stooq已加Cloudflare反爬，不再可靠）
     try:
-        brent_s = fetch_from_stooq("cb.f")
-        if brent_s and brent_s["close"]:
-            data["brent"] = brent_s["close"]
-            data["brent_high"] = brent_s["high"]
-            data["brent_low"] = brent_s["low"]
-            if brent_s["open"] and brent_s["open"] > 0:
-                data["brent_change"] = (brent_s["close"] - brent_s["open"]) / brent_s["open"] * 100
-            data["source"] = "stooq"
+        brent_y = fetch_from_yahoo("BZ=F")
+        if brent_y and brent_y["price"]:
+            data["brent"] = brent_y["price"]
+            data["brent_change"] = brent_y.get("change_pct")
+            data["brent_high"] = brent_y.get("high")
+            data["brent_low"] = brent_y.get("low")
+            data["source"] = "yahoo"
 
-        wti_s = fetch_from_stooq("cl.f")
-        if wti_s and wti_s["close"]:
-            data["wti"] = wti_s["close"]
-            data["wti_high"] = wti_s["high"]
-            data["wti_low"] = wti_s["low"]
-            if wti_s["open"] and wti_s["open"] > 0:
-                data["wti_change"] = (wti_s["close"] - wti_s["open"]) / wti_s["open"] * 100
+        wti_y = fetch_from_yahoo("CL=F")
+        if wti_y and wti_y["price"]:
+            data["wti"] = wti_y["price"]
+            data["wti_change"] = wti_y.get("change_pct")
+            data["wti_high"] = wti_y.get("high")
+            data["wti_low"] = wti_y.get("low")
             if data["source"] == "manual":
-                data["source"] = "stooq"
+                data["source"] = "yahoo"
     except Exception as e:
-        print(f"[WARN] Stooq原油API失败: {e}")
+        print(f"[WARN] Yahoo Finance原油API失败: {e}")
 
-    # 备用数据源: 东方财富
+    # 备用数据源1: Stooq（可能因Cloudflare反爬失败）
+    if data["brent"] is None:
+        try:
+            brent_s = fetch_from_stooq("cb.f")
+            if brent_s and brent_s["close"]:
+                data["brent"] = brent_s["close"]
+                data["brent_high"] = brent_s["high"]
+                data["brent_low"] = brent_s["low"]
+                if brent_s["open"] and brent_s["open"] > 0:
+                    data["brent_change"] = (brent_s["close"] - brent_s["open"]) / brent_s["open"] * 100
+                if data["source"] == "manual":
+                    data["source"] = "stooq"
+        except Exception as e:
+            print(f"[WARN] Stooq布伦特API失败: {e}")
+
+    if data["wti"] is None:
+        try:
+            wti_s = fetch_from_stooq("cl.f")
+            if wti_s and wti_s["close"]:
+                data["wti"] = wti_s["close"]
+                data["wti_high"] = wti_s["high"]
+                data["wti_low"] = wti_s["low"]
+                if wti_s["open"] and wti_s["open"] > 0:
+                    data["wti_change"] = (wti_s["close"] - wti_s["open"]) / wti_s["open"] * 100
+                if data["source"] == "manual":
+                    data["source"] = "stooq"
+        except Exception as e:
+            print(f"[WARN] Stooq WTI API失败: {e}")
+
+    # 备用数据源2: 东方财富
     if data["brent"] is None:
         try:
             brent_url = "https://push2.eastmoney.com/api/qt/stock/get?secid=113.B00Y&fields=f43,f44,f45,f46,f47,f48,f169,f170"
@@ -237,21 +264,37 @@ def fetch_oil_prices():
     return data
 
 def fetch_henry_hub():
-    """采集Henry Hub天然气期货价格"""
+    """采集Henry Hub天然气期货价格
+    数据源优先级: Yahoo Finance(主力) -> Stooq(备用)
+    """
     data = {"price": None, "change_pct": None, "high": None, "low": None, "source": "manual"}
 
-    # 主力数据源: Stooq
+    # 主力数据源: Yahoo Finance
     try:
-        hh = fetch_from_stooq("ng.f")
-        if hh and hh["close"]:
-            data["price"] = hh["close"]
-            data["high"] = hh["high"]
-            data["low"] = hh["low"]
-            if hh["open"] and hh["open"] > 0:
-                data["change_pct"] = (hh["close"] - hh["open"]) / hh["open"] * 100
-            data["source"] = "stooq"
+        hh_y = fetch_from_yahoo("NG=F")
+        if hh_y and hh_y["price"]:
+            data["price"] = hh_y["price"]
+            data["change_pct"] = hh_y.get("change_pct")
+            data["high"] = hh_y.get("high")
+            data["low"] = hh_y.get("low")
+            data["source"] = "yahoo"
     except Exception as e:
-        print(f"[WARN] Stooq Henry Hub API失败: {e}")
+        print(f"[WARN] Yahoo Finance Henry Hub API失败: {e}")
+
+    # 备用: Stooq（可能因Cloudflare反爬失败）
+    if data["price"] is None:
+        try:
+            hh = fetch_from_stooq("ng.f")
+            if hh and hh["close"]:
+                data["price"] = hh["close"]
+                data["high"] = hh["high"]
+                data["low"] = hh["low"]
+                if hh["open"] and hh["open"] > 0:
+                    data["change_pct"] = (hh["close"] - hh["open"]) / hh["open"] * 100
+                if data["source"] == "manual":
+                    data["source"] = "stooq"
+        except Exception as e:
+            print(f"[WARN] Stooq Henry Hub API失败: {e}")
 
     # 备用数据源: 东方财富
     if data["price"] is None:
@@ -651,7 +694,7 @@ def fetch_lng168_daily_from_web():
     except Exception:
         pass
 
-    # 策略2: 用Bing搜索
+    # 策略2: 用Bing搜索（限制最近）
     if not article_url:
         try:
             import urllib.parse as _urlparse
@@ -659,10 +702,30 @@ def fetch_lng168_daily_from_web():
             bing_url = f"https://www.bing.com/search?q={search_q}&filters=ex1%3a%22ez1%22"
             search_text = http_get(bing_url, timeout=15)
             if search_text:
-                # 优先搜狐
+                # 优先搜狐，找所有URL
                 found = re.findall(r'(https?://[^"\s]+sohu\.com/a/\d+_\d+)', search_text)
                 if not found:
                     found = re.findall(r'(https?://[^"\s]+baijiahao\.baidu\.com[^"\s]*)', search_text)
+                if found:
+                    article_url = found[0]
+        except Exception:
+            pass
+
+    # 策略2.5: 用百度搜索当天文章（百度对中文内容覆盖最好）
+    if not article_url:
+        try:
+            import urllib.parse as _urlparse
+            date_tag = datetime.now().strftime("%m.%d")
+            search_q = _urlparse.quote(f'LNG物联网 市场整体报价分析 {date_tag}')
+            baidu_url = f"https://www.baidu.com/s?wd={search_q}&rn=10"
+            search_text = http_get(baidu_url, timeout=15)
+            if search_text:
+                # 百度搜索结果中找搜狐/百家号/lng168链接
+                found = re.findall(r'(https?://[^"\s]+sohu\.com/a/\d+_\d+)', search_text)
+                if not found:
+                    found = re.findall(r'(https?://[^"\s]+baijiahao\.baidu\.com[^"\s]*)', search_text)
+                if not found:
+                    found = re.findall(r'(https?://[^"\s]+lng168\.com/[^"\s]+newsDetail[^"\s]*)', search_text)
                 if found:
                     article_url = found[0]
         except Exception:
@@ -689,7 +752,7 @@ def fetch_lng168_daily_from_web():
         result["source"] = "failed"
         return result
 
-    # 抓取文章内容
+    # 抓取文章内容并验证日期
     article_text = http_get(article_url, timeout=15)
     if not article_text:
         result["source"] = "failed"
@@ -698,6 +761,19 @@ def fetch_lng168_daily_from_web():
     # 清理HTML
     clean = re.sub(r'<[^>]+>', ' ', article_text)
     clean = re.sub(r'\s+', ' ', clean)
+
+    # 校验文章日期，如果超过2天则标记过时但仍提取数据
+    article_date_str = ""
+    date_match = re.search(r'2026\.(\d{1,2})\.(\d{1,2})', clean)
+    if date_match:
+        article_date_str = f"2026-{date_match.group(1).zfill(2)}-{date_match.group(2).zfill(2)}"
+        try:
+            art_dt = datetime.strptime(article_date_str, "%Y-%m-%d")
+            days_old = (datetime.now() - art_dt).days
+            if days_old > 2:
+                print(f"[WARN] LNG物联网文章日期{article_date_str}已超过2天，数据可能非今日")
+        except ValueError:
+            pass
 
     # 提取液厂均价
     avg_match = re.search(r'市场均价为(\d+)\s*元', clean)
@@ -863,7 +939,26 @@ def fetch_shpgx_daily():
         except Exception:
             pass
 
-    # 策略4: 搜狐转载的SHPGX文章
+    # 策略4: 百度搜索SHPGX文章（中文搜索效果更好）
+    if not article_url:
+        try:
+            import urllib.parse as _urlparse
+            now = datetime.now()
+            date_tag_cn = f"{now.year}年{now.month}月{now.day}日"
+            search_q = _urlparse.quote(f'SHPGX交易及数据指数发布 {date_tag_cn}')
+            baidu_url = f"https://www.baidu.com/s?wd={search_q}&rn=10"
+            search_text = http_get(baidu_url, timeout=15)
+            if search_text:
+                found = re.findall(r'(https?://finance\.sina\.com\.cn/[^"\s]+doc-[^"\s]+\.shtml)', search_text)
+                if not found:
+                    # 也搜搜狐转载
+                    found = re.findall(r'(https?://[^"\s]+sohu\.com/a/\d+_\d+)', search_text)
+                if found:
+                    article_url = found[0]
+        except Exception:
+            pass
+
+    # 策略5: 直接搜索"SHPGX 价格指数"找最近的文章
     if not article_url:
         try:
             import urllib.parse as _urlparse

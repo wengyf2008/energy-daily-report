@@ -172,6 +172,71 @@ def fetch_from_exchangerate():
     return None
 
 
+def fetch_from_tradingeconomics(page_url):
+    """
+    从TradingEconomics网页提取价格数据（备用数据源）
+    page_url: 如 'https://tradingeconomics.com/commodity/brent-crude-oil'
+    返回: {'price': float, 'prev_close': float, 'change': float, 'change_pct': float, 'source': 'tradingeconomics'}
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    try:
+        text = http_get(page_url, headers=headers, timeout=15)
+        if not text:
+            return None
+        # 提取最新价和前收盘价
+        # TradingEconomics页面格式: "96.61" + "93.09" 等
+        # 尝试从页面中匹配价格数据
+        price = None
+        prev_close = None
+        change_pct = None
+
+        # 方法1: 匹配 JSON-LD 或 data 属性
+        price_match = re.search(r'"price"\s*:\s*"?([\d.]+)"?', text)
+        if price_match:
+            price = float(price_match.group(1))
+
+        # 方法2: 匹配页面中的价格数字表格
+        if not price:
+            # 匹配 "Last" + 数字 格式
+            last_match = re.search(r'(?:Last|Price|当前)[^\d]*?([\d.]+)\s*(?:USD|€|\$|CNY)', text)
+            if not last_match:
+                last_match = re.search(r'class=".*?datatable.*?">([\d.]+)', text)
+            if last_match:
+                price = float(last_match.group(1))
+
+        # 方法3: 从表格中提取 (TradingEconomics常用格式)
+        if not price:
+            # 匹配 "93.85" 这类在表格单元格中的价格
+            table_match = re.findall(r'<td[^>]*>\s*([\d]+\.?[\d]*)\s*</td>', text)
+            for val in table_match:
+                try:
+                    v = float(val)
+                    if 1.0 < v < 200.0:  # 合理的能源价格范围
+                        price = v
+                        break
+                except ValueError:
+                    continue
+
+        # 提取涨跌幅
+        pct_match = re.search(r'([+-]?\d+\.?\d*)%', text)
+        if pct_match:
+            change_pct = float(pct_match.group(1))
+
+        if price:
+            return {
+                "price": round(price, 4),
+                "change_pct": change_pct,
+                "source": "tradingeconomics",
+            }
+    except Exception as e:
+        print(f"[WARN] TradingEconomics获取失败: {e}")
+    return None
+
+
 def fetch_oil_prices():
     """
     采集国际油价
@@ -261,6 +326,29 @@ def fetch_oil_prices():
         except Exception as e:
             print(f"[WARN] 东方财富WTI API失败: {e}")
 
+    # 备用数据源3: TradingEconomics
+    if data["brent"] is None:
+        try:
+            te = fetch_from_tradingeconomics("https://tradingeconomics.com/commodity/brent-crude-oil")
+            if te and te.get("price"):
+                data["brent"] = te["price"]
+                data["brent_change"] = te.get("change_pct")
+                if data["source"] == "manual":
+                    data["source"] = "tradingeconomics"
+        except Exception as e:
+            print(f"[WARN] TradingEconomics布伦特失败: {e}")
+
+    if data["wti"] is None:
+        try:
+            te = fetch_from_tradingeconomics("https://tradingeconomics.com/commodity/crude-oil")
+            if te and te.get("price"):
+                data["wti"] = te["price"]
+                data["wti_change"] = te.get("change_pct")
+                if data["source"] == "manual":
+                    data["source"] = "tradingeconomics"
+        except Exception as e:
+            print(f"[WARN] TradingEconomics WTI失败: {e}")
+
     return data
 
 def fetch_henry_hub():
@@ -311,6 +399,18 @@ def fetch_henry_hub():
         except Exception as e:
             print(f"[WARN] 东方财富Henry Hub API失败: {e}")
 
+    # 备用数据源: TradingEconomics
+    if data["price"] is None:
+        try:
+            te = fetch_from_tradingeconomics("https://tradingeconomics.com/commodity/natural-gas")
+            if te and te.get("price"):
+                data["price"] = te["price"]
+                data["change_pct"] = te.get("change_pct")
+                if data["source"] == "manual":
+                    data["source"] = "tradingeconomics"
+        except Exception as e:
+            print(f"[WARN] TradingEconomics Henry Hub失败: {e}")
+
     return data
 
 
@@ -341,6 +441,18 @@ def fetch_ttf_price():
                 data["source"] = "stooq"
         except Exception as e:
             print(f"[WARN] Stooq TTF API失败: {e}")
+
+    # 备用数据源2: TradingEconomics
+    if data["price"] is None:
+        try:
+            te = fetch_from_tradingeconomics("https://tradingeconomics.com/commodity/eu-natural-gas")
+            if te and te.get("price"):
+                data["price"] = te["price"]
+                data["change_pct"] = te.get("change_pct")
+                if data["source"] == "manual":
+                    data["source"] = "tradingeconomics"
+        except Exception as e:
+            print(f"[WARN] TradingEconomics TTF失败: {e}")
 
     return data
 
@@ -2094,6 +2206,49 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
     </div>
   </section>
 
+  <section>
+    <div class="section-title">⚠️ 七、风险矩阵评估</div>
+    <div style="display:grid; gap:12px; margin-bottom:20px;">
+      <div style="background:#fff3f3;border-left:4px solid #e74c3c;padding:10px 14px;border-radius:0 6px 6px 0;">
+        <strong>地缘政治</strong> <span style="color:#e74c3c;font-weight:700;">极高</span>
+        <div style="background:#eee;height:8px;border-radius:4px;margin-top:4px;"><div style="background:#e74c3c;height:8px;border-radius:4px;width:95%25;"></div></div>
+        <div style="font-size:12px;color:#888;margin-top:2px;">{'伊朗-以色列冲突升级，霍尔木兹海峡封锁风险持续' if brent > 90 else '地缘风险可控'}</div>
+      </div>
+      <div style="background:#fff8f0;border-left:4px solid #e67e22;padding:10px 14px;border-radius:0 6px 6px 0;">
+        <strong>供应风险</strong> <span style="color:#e67e22;font-weight:700;">高</span>
+        <div style="background:#eee;height:8px;border-radius:4px;margin-top:4px;"><div style="background:#e67e22;height:8px;border-radius:4px;width:85%25;"></div></div>
+        <div style="font-size:12px;color:#888;margin-top:2px;">中东原油供应中断风险，华东接收站供应偏紧</div>
+      </div>
+      <div style="background:#fffbf0;border-left:4px solid #f39c12;padding:10px 14px;border-radius:0 6px 6px 0;">
+        <strong>需求风险</strong> <span style="color:#f39c12;font-weight:700;">中等</span>
+        <div style="background:#eee;height:8px;border-radius:4px;margin-top:4px;"><div style="background:#f39c12;height:8px;border-radius:4px;width:55%25;"></div></div>
+        <div style="font-size:12px;color:#888;margin-top:2px;">夏季用气高峰来临，国内工业需求平稳</div>
+      </div>
+      <div style="background:#fff3f3;border-left:4px solid #e74c3c;padding:10px 14px;border-radius:0 6px 6px 0;">
+        <strong>价格波动</strong> <span style="color:#e74c3c;font-weight:700;">极高</span>
+        <div style="background:#eee;height:8px;border-radius:4px;margin-top:4px;"><div style="background:#e74c3c;height:8px;border-radius:4px;width:90%25;"></div></div>
+        <div style="font-size:12px;color:#888;margin-top:2px;">原油单日波动超3%25，天然气区域价差扩大</div>
+      </div>
+      <div style="background:#fffbf0;border-left:4px solid #f39c12;padding:10px 14px;border-radius:0 6px 6px 0;">
+        <strong>政策风险</strong> <span style="color:#f39c12;font-weight:700;">中等</span>
+        <div style="background:#eee;height:8px;border-radius:4px;margin-top:4px;"><div style="background:#f39c12;height:8px;border-radius:4px;width:50%25;"></div></div>
+        <div style="font-size:12px;color:#888;margin-top:2px;">OPEC+增产有限，美联储鹰派预期</div>
+      </div>
+    </div>
+
+    <div class="analysis-box">
+      <h3>三情景分析</h3>
+      <table style="width:100%25;">
+        <thead><tr><th>情景</th><th>概率</th><th>布伦特</th><th>JKM</th><th>关键假设</th></tr></thead>
+        <tbody>
+          <tr><td>🟢 乐观</td><td>20%25</td><td>{brent-8:.0f}-{brent-3:.0f} $/bbl</td><td>{max(jkm-4,12):.0f}-{max(jkm-2,14):.0f} $/MMBtu</td><td>伊以停火，海峡复通</td></tr>
+          <tr><td>🟡 基准</td><td>50%25</td><td>{brent-5:.0f}-{brent+5:.0f} $/bbl</td><td>{jkm-2:.0f}-{jkm+3:.0f} $/MMBtu</td><td>冲突维持现状</td></tr>
+          <tr><td>🔴 悲观</td><td>30%25</td><td>>{brent+15:.0f} $/bbl</td><td>>{jkm+7:.0f} $/MMBtu</td><td>全面升级，海峡长期封锁</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
 </div>
 <div class="footer">
   <p>本报告由能源市场日报自动生成系统产出 | 数据来源：ICE、NYMEX、Yahoo Finance、EIA、ICE ENDEX、S&P Global Platts、我的钢铁网、LNG物联网、生意社(100ppi)、新浪财经SHPGX、隆众资讯、各省发改委</p>
@@ -2103,45 +2258,82 @@ def generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pip
 </html>"""
     return html
 
-def generate_text_summary(report_date, oil_data, hh_data, jkm_data, lng_data):
-    """生成纯文本简报（用于企业微信/飞书推送）"""
+def generate_text_summary(report_date, oil_data, hh_data, jkm_data, lng_data, ttf_data=None, fx_data=None, news_data=None, insights_data=None):
+    """生成markdown格式简报（用于企业微信/飞书推送）"""
     brent = oil_data.get("brent") or 95.31
     wti = oil_data.get("wti") or 94.59
-    brent_chg = oil_data.get("brent_change") or 2.6
-    wti_chg = oil_data.get("wti_change") or 2.7
+    brent_chg = oil_data.get("brent_change") or 0
+    wti_chg = oil_data.get("wti_change") or 0
     hh_price = hh_data.get("price") or 3.079
-    hh_chg = hh_data.get("change_pct") or -0.52
+    hh_chg = hh_data.get("change_pct") or 0
     jkm = jkm_data.get("price") or 19.04
+    jkm_chg = jkm_data.get("change_pct") or 0
     lng_domestic = lng_data.get("domestic_avg") or 5963
     lng_terminal = lng_data.get("terminal_avg") or 6780
-    
-    text = f"""⚡ 能源市场日报 | {report_date}
-━━━━━━━━━━━━━━━━━━━━
-🛢️ 国际原油
-  布伦特: {brent:.2f} 美元/桶 (▲{brent_chg}%)
-  WTI:    {wti:.2f} 美元/桶 (▲{wti_chg}%)
+    ttf_price = (ttf_data or {}).get("price") or 0
+    ttf_chg = (ttf_data or {}).get("change_pct") or 0
+    usdcny = (fx_data or {}).get("rate") or 0
 
-🔥 国际天然气
-  Henry Hub:  {hh_price:.3f} 美元/MMBtu ({hh_chg:+.2f}%)
-  JKM东北亚:  {jkm:.2f} 美元/MMBtu (高位震荡)
-  TTF欧洲:    58.50 欧元/兆瓦时
+    def _arrow(v):
+        if v > 0.5: return "↑"
+        elif v < -0.5: return "↓"
+        else: return "→"
 
-🏭 国内LNG
-  国产液厂均价:  {lng_domestic:,} 元/吨
-  接收站均价:    {lng_terminal:,} 元/吨
+    # 动态风险矩阵
+    risk_level = "高"
+    geo_risk = "中东局势紧张"
+    if brent > 100:
+        risk_level = "极高"
+        geo_risk = "地缘冲突升级，霍尔木兹海峡封锁风险极高"
+    elif brent > 90:
+        risk_level = "高"
+        geo_risk = "中东局势紧张，油价维持高位"
+    elif brent > 80:
+        risk_level = "中等"
+        geo_risk = "地缘风险可控，市场关注供需"
+    else:
+        risk_level = "较低"
+        geo_risk = "地缘风险缓和"
 
-🌍 地缘政治
-  🚨 美军5/28再袭伊朗目标，科威特拉响防空警报
-  ⚠ 霍尔木兹海峡局势反复，美伊「边打边谈」
+    # 三情景简述
+    scenario_base_brent = round(brent)
+    scenario_optimistic = round(brent - 8)
+    scenario_pessimistic = round(brent + 15)
 
-📊 策略建议
-  1. 最大化管道气合同量，减少高价LNG现货依赖
-  2. 加快储气库注气，锁定冬季保供成本
-  3. 关注非居民顺价窗口，避免购销倒挂
+    # 新闻摘要（取前3条）
+    news_lines = ""
+    if news_data:
+        for n in news_data[:3]:
+            news_lines += f"  - {n['title'][:50]}\n"
+    if not news_lines:
+        news_lines = "  - 暂无最新动态\n"
 
-━━━━━━━━━━━━━━━━━━━━
-数据来源: ICE/NYMEX/LNG物联网/隆众资讯
-声明: 仅供内部参考，不构成投资建议
+    text = f"""⚡ **能源市场日报** | {report_date}
+
+🛢️ **国际原油**
+> 布伦特: **{brent:.2f}** $/bbl {_arrow(brent_chg)}{brent_chg:+.1f}%
+> WTI: **{wti:.2f}** $/bbl {_arrow(wti_chg)}{wti_chg:+.1f}%
+
+🔥 **国际天然气**
+> Henry Hub: **{hh_price:.3f}** $/MMBtu {_arrow(hh_chg)}{hh_chg:+.1f}%
+> TTF: **{ttf_price:.1f}** €/MWh {_arrow(ttf_chg)}{ttf_chg:+.1f}%
+> JKM: **{jkm:.2f}** $/MMBtu {_arrow(jkm_chg)}{jkm_chg:+.1f}%
+
+💱 **汇率**: USD/CNY **{usdcny:.4f}**{'  ' if usdcny else ''}
+
+🏭 **国内LNG**
+> 液厂均价: **{lng_domestic:,}** 元/吨
+> 接收站均价: **{lng_terminal:,}** 元/吨
+
+⚠️ **风险等级: {risk_level}** — {geo_risk}
+
+🌍 **要闻**
+{news_lines}
+📊 **三情景**
+> 🟢乐观: 布伦特{scenario_optimistic}$ | 🟡基准: {scenario_base_brent}$ | 🔴悲观: {scenario_pessimistic}$
+
+_数据来源: ICE/NYMEX/TradingEconomics/LNG物联网/隆众资讯_
+_仅供内部参考，不构成投资建议_
 """
     return text
 
@@ -2192,15 +2384,16 @@ def push_email(html_content, report_date, pdf_path=None):
         return False
 
 def push_wecom(text_content):
-    """通过企业微信机器人webhook推送"""
+    """通过企业微信机器人webhook推送（支持markdown格式）"""
     webhook = CONFIG["wecom_webhook"]
     if not webhook:
         print("[WARN] 企业微信webhook未配置，跳过推送")
         return False
     
+    # 企业微信支持markdown msgtype，格式更丰富
     payload = json.dumps({
-        "msgtype": "text",
-        "text": {
+        "msgtype": "markdown",
+        "markdown": {
             "content": text_content,
         }
     }).encode("utf-8")
@@ -2363,7 +2556,7 @@ def run_report(push_channel="email", report_date=None):
     # 4. 推送
     if push_channel:
         print(f"\n[4/4] 推送报告 (渠道: {push_channel})...")
-        text_summary = generate_text_summary(report_date, oil_data, hh_data, jkm_data, lng_data)
+        text_summary = generate_text_summary(report_date, oil_data, hh_data, jkm_data, lng_data, ttf_data, fx_data, news_data, insights_data)
 
         push_results = []
         if push_channel in ("email", "all"):

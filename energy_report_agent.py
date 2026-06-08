@@ -1528,7 +1528,7 @@ def fetch_market_insights(oil_data=None, hh_data=None, ttf_data=None, jkm_data=N
         "oil": {
             "headline": oil_headline,
             "drivers": [
-                (f"📊 布伦特{brent:.2f}美元({brent_chg:+.1f}%)", f"WTI报{wti:.2f}美元({((oil_data or {}).get('wti_change') or 0):+.1f}%)，价差{wti-brent:.2f}美元。油价日内{oil_dir}，反映当前市场对供需和地缘风险的定价。"),
+                (f"📊 布伦特{brent:.2f}美元({brent_chg:+.1f}%)", f"WTI报{wti:.2f}美元({(oil_data or {}).get('wti_change', 0):+.1f}%)，价差{wti-brent:.2f}美元。油价日内{oil_dir}，反映当前市场对供需和地缘风险的定价。"),
                 ("🇺🇸🇮🇷 中东局势", "美伊冲突持续影响霍尔木兹海峡航运安全，市场对原油供应中断保持警惕。冲突走向仍是油价短期最大变量。"),
                 ("🛢️ OPEC+供应", "沙特等国表态将在必要时释放剩余产能，但实际补偿能力存疑。OPEC+下次会议将讨论产量调整。"),
                 ("📉 需求前景", "中国炼厂开工回升支撑需求预期，但全球经济增长放缓限制油价上方空间。EIA库存变化需持续关注。"),
@@ -2260,19 +2260,24 @@ def main():
     parser.add_argument("--date", default=None, help="报告日期 (YYYY-MM-DD)，默认为今天")
     parser.add_argument("--output", default=None, help="输出文件路径")
     args = parser.parse_args()
-    
-    # 确定报告日期
-    if args.date:
-        report_date = args.date
-    else:
+
+    report_date = args.date or datetime.now().strftime("%Y-%m-%d")
+    run_report(push_channel=args.push or "", report_date=report_date)
+
+
+def run_report(push_channel="email", report_date=None):
+    """核心日报生成逻辑（可被main/SCF/其他调用方复用）
+    返回: (html_path, success_bool)
+    """
+    if not report_date:
         report_date = datetime.now().strftime("%Y-%m-%d")
-    
+
     print("=" * 60)
     print(f"  能源市场日报自动生成系统")
     print(f"  报告日期: {report_date}")
     print(f"  执行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
-    
+
     # 1. 采集数据
     print("\n[1/4] 采集数据中...")
     oil_data = fetch_oil_prices()
@@ -2290,14 +2295,14 @@ def main():
     jkm_data = fetch_jkm_price()
     jkm_extra = f" ({jkm_data.get('date')})" if jkm_data.get("date") else ""
     print(f"  JKM现货: {jkm_data.get('price')}{jkm_extra} (来源: {jkm_data['source']})")
-    
+
     lng_data = fetch_lng_prices()
     print(f"  国内LNG: 国产={lng_data.get('domestic_avg')}, 接收站={lng_data.get('terminal_avg')} (来源: {lng_data['source']})")
     if lng_data.get("benchmark"):
         print(f"  生意社LNG基准价: {lng_data['benchmark']} 参考价: {lng_data.get('reference')} ({lng_data.get('ref_change_pct', 0):+.2f}%)")
     if lng_data.get("market_comment"):
         print(f"  市场评述: {lng_data['market_comment'][:60]}...")
-    
+
     # 传递SHPGX数据给管道气函数
     shpgx_data = lng_data.get("shpgx", {})
     pipe_data = fetch_pipeline_gas_prices(shpgx_data)
@@ -2305,33 +2310,29 @@ def main():
     if shpgx_data.get("lng_factory_price") and not shpgx_data.get("source", "").endswith("stale"):
         shpgx_note = f" + SHPGX指数(LNG出厂={shpgx_data['lng_factory_price']}, 出站={shpgx_data.get('lng_terminal_price', '—')})"
     print(f"  管道气门站价: 已加载{len(pipe_data.get('provinces', {}))}省份数据{shpgx_note}")
-    
+
     news_data = fetch_geopolitical_news()
     print(f"  地缘新闻: 已采集{len(news_data)}条")
-    
+
     insights_data = fetch_market_insights(oil_data, hh_data, ttf_data, jkm_data, lng_data)
     print(f"  市场洞察: 已加载{len(insights_data)}板块")
-    
+
     # 2. 生成报告
     print("\n[2/4] 生成HTML报告...")
     html_content = generate_html_report(report_date, oil_data, hh_data, jkm_data, lng_data, pipe_data, news_data, insights_data, ttf_data, fx_data)
-    
+
     # 3. 保存HTML + 生成PDF
     print("\n[3/4] 保存报告 & 生成PDF...")
     output_dir = CONFIG["output_dir"]
     os.makedirs(output_dir, exist_ok=True)
-    
+
     date_tag = report_date.replace("-", "")
-    
-    if args.output:
-        html_path = args.output
-    else:
-        html_path = os.path.join(output_dir, f"energy_daily_report_{date_tag}.html")
-    
+    html_path = os.path.join(output_dir, f"energy_daily_report_{date_tag}.html")
+
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html_content)
     print(f"  HTML报告已保存: {html_path}")
-    
+
     # 生成PDF
     pdf_path = os.path.join(output_dir, f"energy_daily_report_{date_tag}.pdf")
     try:
@@ -2341,7 +2342,7 @@ def main():
     except Exception as e:
         print(f"  [WARN] PDF生成失败: {e}")
         pdf_path = None
-    
+
     # 保存最新版
     latest_html = os.path.join(output_dir, "energy_daily_report_latest.html")
     latest_pdf = os.path.join(output_dir, "energy_daily_report_latest.pdf")
@@ -2351,13 +2352,12 @@ def main():
         import shutil
         shutil.copy(pdf_path, latest_pdf)
     print(f"  最新版已更新: {latest_html}, {latest_pdf}")
-    
+
     # 4. 推送
-    push_channel = args.push
     if push_channel:
         print(f"\n[4/4] 推送报告 (渠道: {push_channel})...")
         text_summary = generate_text_summary(report_date, oil_data, hh_data, jkm_data, lng_data)
-        
+
         push_results = []
         if push_channel in ("email", "all"):
             push_results.append(("邮件", push_email(html_content, report_date, pdf_path)))
@@ -2365,19 +2365,71 @@ def main():
             push_results.append(("企业微信", push_wecom(text_summary)))
         if push_channel in ("feishu", "all"):
             push_results.append(("飞书", push_feishu(text_summary)))
-        
+
         for channel, success in push_results:
             status = "✅" if success else "❌"
             print(f"  {status} {channel}: {'成功' if success else '失败'}")
     else:
         print("\n[4/4] 跳过推送 (未指定推送渠道)")
-    
+
     print("\n" + "=" * 60)
     print(f"  ✅ 日报生成完成！")
     print(f"  📄 报告路径: {html_path}")
     print("=" * 60)
-    
+
     return html_path
+
+
+def main():
+    parser = argparse.ArgumentParser(description="能源市场日报自动生成与推送")
+    parser.add_argument("--push", choices=["email", "wecom", "feishu", "all"], default=None,
+                        help="推送渠道 (默认仅生成本地文件)")
+    parser.add_argument("--date", default=None, help="报告日期 (YYYY-MM-DD)，默认为今天")
+    parser.add_argument("--output", default=None, help="输出文件路径")
+    args = parser.parse_args()
+
+    report_date = args.date or datetime.now().strftime("%Y-%m-%d")
+    run_report(push_channel=args.push or "", report_date=report_date)
+
+
+# ============================================================
+# 腾讯云函数 SCF 入口
+# ============================================================
+def main_handler(event, context):
+    """腾讯云函数SCF入口函数
+    定时触发器每天8:00(UTC+8)自动调用此函数
+
+    环境变量配置（在SCF控制台设置）:
+      SMTP_HOST=smtp.qq.com
+      SMTP_PORT=465
+      SMTP_USER=37550656@qq.com
+      SMTP_PASS=你的授权码
+      SMTP_FROM=37550656@qq.com
+      SMTP_TO=37550656@qq.com,249688406@qq.com,857137674@qq.com
+    """
+    try:
+        html_path = run_report(push_channel="email")
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "success": True,
+                "message": f"日报生成并推送成功: {html_path}",
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }, ensure_ascii=False)
+        }
+    except Exception as e:
+        print(f"[ERROR] SCF执行失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "statusCode": 500,
+            "body": json.dumps({
+                "success": False,
+                "message": f"日报生成失败: {str(e)}",
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }, ensure_ascii=False)
+        }
+
 
 if __name__ == "__main__":
     main()

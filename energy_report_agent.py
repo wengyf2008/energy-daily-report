@@ -44,8 +44,8 @@ CONFIG = {
     "wecom_webhook": os.environ.get("WECOM_WEBHOOK", ""),
     # 飞书机器人webhook
     "feishu_webhook": os.environ.get("FEISHU_WEBHOOK", ""),
-    # 报告输出路径
-    "output_dir": os.environ.get("REPORT_OUTPUT_DIR", "reports"),
+    # 报告输出路径（SCF环境只有/tmp可写）
+    "output_dir": os.environ.get("REPORT_OUTPUT_DIR", "/tmp/reports" if os.path.exists("/.dockerenv") or os.environ.get("SCF_RUNTIME") else "reports"),
 }
 
 # ============================================================
@@ -2333,15 +2333,22 @@ def run_report(push_channel="email", report_date=None):
         f.write(html_content)
     print(f"  HTML报告已保存: {html_path}")
 
-    # 生成PDF
-    pdf_path = os.path.join(output_dir, f"energy_daily_report_{date_tag}.pdf")
-    try:
-        from weasyprint import HTML as WHTML
-        WHTML(string=html_content).write_pdf(pdf_path)
-        print(f"  PDF报告已生成: {pdf_path}")
-    except Exception as e:
-        print(f"  [WARN] PDF生成失败: {e}")
-        pdf_path = None
+    # 生成PDF（SCF等无weasyprint环境自动跳过）
+    pdf_path = None
+    is_scf = os.environ.get("SCF_RUNTIME") or os.environ.get("TENCENTCLOUD_RUNENV")
+    if not is_scf:
+        try:
+            from weasyprint import HTML as WHTML
+            pdf_path = os.path.join(output_dir, f"energy_daily_report_{date_tag}.pdf")
+            WHTML(string=html_content).write_pdf(pdf_path)
+            print(f"  PDF报告已生成: {pdf_path}")
+        except ImportError:
+            print(f"  [INFO] weasyprint未安装，跳过PDF生成（邮件仅含HTML）")
+        except Exception as e:
+            print(f"  [WARN] PDF生成失败: {e}")
+            pdf_path = None
+    else:
+        print(f"  [INFO] SCF环境，跳过PDF生成（邮件仅含HTML）")
 
     # 保存最新版
     latest_html = os.path.join(output_dir, "energy_daily_report_latest.html")

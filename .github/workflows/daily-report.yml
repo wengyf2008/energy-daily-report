@@ -3,17 +3,16 @@ name: 能源市场日报（每天7:30自动生成并推送）
 on:
   schedule:
     # 北京时间每天早上7:30 (UTC 23:30 前一天) + 7:35 兜底
-    # 避开GitHub午夜高峰(UTC 0:00)导致的schedule严重延迟
     - cron: "30 23 * * *"
     - cron: "35 23 * * *"
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:
   push:
     paths:
       - "energy_report_agent.py"
       - ".github/workflows/daily-report.yml"
 
 permissions:
-  actions: write  # keep-alive需要写权限来重新启用被禁用的workflow
+  actions: write
 
 jobs:
   # 保持仓库活跃，防止GitHub因60天不活动而禁用schedule
@@ -57,15 +56,13 @@ jobs:
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
         run: |
           set -x
-          python3 energy_report_agent.py --push email 2>&amp;1 | tee reports/run.log || true
-          echo "✅ 日报生成并推送完成"
+          python3 energy_report_agent.py --push email || true
+          echo "日报生成并推送完成"
 
-      - name: 上传日报存档（含日志）
+      - name: 上传日报存档
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: daily-report-${{ github.run_id }}
-          path: |
-            reports/
-            reports/run.log
+          path: reports/
           retention-days: 7

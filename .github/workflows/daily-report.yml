@@ -12,8 +12,22 @@ on:
       - "energy_report_agent.py"
       - ".github/workflows/daily-report.yml"
 
+permissions:
+  actions: write  # keep-alive需要写权限来重新启用被禁用的workflow
+
 jobs:
+  # 保持仓库活跃，防止GitHub因60天不活动而禁用schedule
+  keep-alive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 保持定时工作流活跃
+        uses: WaterLemons2k/scheduled-workflow-activity-action@v2
+        with:
+          workflows: "daily-report.yml"
+
   generate-report:
+    needs: keep-alive
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -43,7 +57,7 @@ jobs:
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
         run: |
           set -x
-          python3 energy_report_agent.py --push email 2>&1 | tee reports/run.log || true
+          python3 energy_report_agent.py --push email 2>&amp;1 | tee reports/run.log || true
           echo "✅ 日报生成并推送完成"
 
       - name: 上传日报存档（含日志）

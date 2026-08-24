@@ -57,7 +57,7 @@ jobs:
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
         run: |
           set -x
-          python3 energy_report_agent.py --push email 2>&amp;1 | tee reports/run.log || true
+          python3 energy_report_agent.py --push email 2>&amp;amp;1 | tee reports/run.log || true
           echo "✅ 日报生成并推送完成"
 
       - name: 上传日报存档（含日志）
